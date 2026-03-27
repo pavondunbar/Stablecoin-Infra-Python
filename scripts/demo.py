@@ -18,6 +18,7 @@ Usage:
 
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -163,7 +164,7 @@ def demo_rtgs(bank_a_id: str, bank_b_id: str) -> dict:
     h1("2 · Real-Time Gross Settlement (RTGS)")
 
     step("Submit URGENT $5M settlement: Bank A → Bank B")
-    r = client.post("/v1/settlements", json={
+    r = client.post("/v1/settlements/submit", json={
         "sending_account_id":   bank_a_id,
         "receiving_account_id": bank_b_id,
         "currency":             "USD",
@@ -188,7 +189,7 @@ def demo_rtgs(bank_a_id: str, bank_b_id: str) -> dict:
         fail("Settlement did not complete in time.")
 
     step("Submit NORMAL priority $500K: Bank B → Bank A (return payment)")
-    r = client.post("/v1/settlements", json={
+    r = client.post("/v1/settlements/submit", json={
         "sending_account_id":   bank_b_id,
         "receiving_account_id": bank_a_id,
         "currency":             "USD",
@@ -329,10 +330,10 @@ def demo_fx_settlement(bank_a_id: str, bank_b_id: str) -> dict:
     for rate in rates[:4]:
         info(f"  {rate['base']}/{rate['quote']}  mid={rate['mid_rate']}  spread={rate['spread_bps']}bps")
 
-    step("Request FX quote: $10M USD → EUR")
+    step("Request FX quote: $500K USD → EUR")
     r    = client.post("/v1/fx/quote", json={
         "sell_currency": "USD",
-        "sell_amount":   "10000000.00",
+        "sell_amount":   "500000.00",
         "buy_currency":  "EUR",
     })
     data = check(r, 200)
@@ -340,12 +341,12 @@ def demo_fx_settlement(bank_a_id: str, bank_b_id: str) -> dict:
     ok(f"  Applied rate: {data['applied_rate']}  (mid: {data['mid_rate']}, spread: {data['spread_bps']}bps)")
     ok(f"  Valid until: {data['quote_valid_until']}")
 
-    step("Execute $10M USD→EUR FX settlement via blockchain rails")
+    step("Execute $500K USD→EUR FX settlement via blockchain rails")
     r    = client.post("/v1/fx/settle", json={
         "sending_account_id":   bank_a_id,
         "receiving_account_id": bank_b_id,
         "sell_currency":        "USD",
-        "sell_amount":          "10000000.00",
+        "sell_amount":          "500000.00",
         "buy_currency":         "EUR",
         "rails":                "blockchain",
     })
@@ -419,10 +420,20 @@ def run():
     bank_b_id = data["account_id"]
     ok(f"Bank B created: {bank_b_id} ({data['entity_name']})")
 
-    info("NOTE: Marking accounts KYC/AML verified (normally done via compliance service)")
-    info(f"  In production: UPDATE accounts SET kyc_verified=true, aml_cleared=true WHERE id IN ('{bank_a_id}', '{bank_b_id}');")
-    info("  For this demo, please run the SQL above against the Postgres container, then re-run.")
-    info("  Or the issuance calls will return 403. Continuing demo assuming accounts are cleared…")
+    step("Mark both accounts KYC/AML verified (via Postgres)")
+    sql = (
+        f"UPDATE accounts SET kyc_verified=true, aml_cleared=true "
+        f"WHERE id IN ('{bank_a_id}', '{bank_b_id}');"
+    )
+    result = subprocess.run(
+        ["docker", "exec", "stablecoin-infra-postgres-1",
+         "psql", "-U", "stablecoin", "-d", "stablecoin_db", "-c", sql],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        fail(f"SQL failed: {result.stderr.strip()}")
+        sys.exit(1)
+    ok("Both accounts cleared for KYC/AML (demo shortcut).")
 
     # ── Run each module demo ──────────────────────────────────────────────────
     try:

@@ -466,12 +466,7 @@ curl http://localhost:8000/health
 ### 4. Run the demo
 
 ```bash
-docker compose exec api-gateway python /app/scripts/demo.py
-```
-
-Or from the host (if Python dependencies are installed):
-
-```bash
+pip install httpx
 python scripts/demo.py
 ```
 
