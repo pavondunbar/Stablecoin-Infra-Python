@@ -96,8 +96,8 @@ def step(title: str):
 
 # ─── Demo ─────────────────────────────────────────────────────────────────────
 
-def wait_healthy(retries: int = 12, delay: float = 5.0):
-    """Wait until the gateway reports all services healthy."""
+def wait_healthy(retries: int = 15, delay: float = 5.0):
+    """Wait until the gateway reports all services healthy (including signing)."""
     info(f"Waiting for {GW}/health …")
     for i in range(retries):
         try:
@@ -105,7 +105,7 @@ def wait_healthy(retries: int = 12, delay: float = 5.0):
             if r.status_code == 200:
                 data = r.json()
                 if all(v == "ok" for v in data["services"].values()):
-                    ok("All services healthy.")
+                    ok("All services healthy (including signing gateway).")
                     return
             print(f"  retry {i+1}/{retries} — {r.json().get('services', {})}")
         except Exception as exc:
@@ -364,7 +364,11 @@ def demo_fx_settlement(bank_a_id: str, bank_b_id: str) -> dict:
         s = check(r, 200)
         info(f"  attempt {attempt+1}: status={s['status']}")
         if s["status"] == "settled":
-            ok(f"PvP settled! blockchain_tx_hash={s['blockchain_tx_hash']}")
+            tx_hash = s.get("blockchain_tx_hash", "")
+            if tx_hash and tx_hash.startswith("0x"):
+                ok(f"PvP settled! MPC-signed hash={tx_hash[:18]}...")
+            else:
+                ok("PvP settled! (no blockchain hash — non-blockchain rails)")
             ok(f"  sell_txn={s['sell_txn_id']}")
             ok(f"  buy_txn={s['buy_txn_id']}")
             break
@@ -426,7 +430,7 @@ def run():
         f"WHERE id IN ('{bank_a_id}', '{bank_b_id}');"
     )
     result = subprocess.run(
-        ["docker", "exec", "stablecoin-infra-postgres-1",
+        ["docker", "exec", "stablecoin-python-postgres-1",
          "psql", "-U", "stablecoin", "-d", "stablecoin_db", "-c", sql],
         capture_output=True, text=True, timeout=10,
     )
@@ -451,8 +455,8 @@ def run():
     ok("RTGS gross settlement with priority queuing")
     ok("Conditional payments: time-lock, oracle, multi-sig, delivery")
     ok("Escrow contracts with atomic lock/release/refund")
-    ok("Cross-border PvP FX settlement via blockchain rails")
-    ok("All events published to Kafka audit trail")
+    ok("Cross-border PvP FX settlement with MPC-signed blockchain hash")
+    ok("All events published via transactional outbox to Kafka")
     print(f"\n  {BOLD}Explore the OpenAPI docs at: {GW}/docs{RESET}\n")
 
 

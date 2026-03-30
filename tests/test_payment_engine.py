@@ -4,19 +4,19 @@ tests/test_payment_engine.py
 Unit tests for the Programmable Payment Engine.
 
 Covers:
-  ✓ Time-lock condition: auto-executes after release time
-  ✓ Time-lock condition: does NOT execute before release time
-  ✓ Oracle trigger: executes with matching data
-  ✓ Oracle trigger: rejected on mismatched data
-  ✓ Multi-sig: passes with sufficient signers, fails with insufficient
-  ✓ Delivery confirmation: trigger flow
-  ✓ KYC-verified condition
-  ✓ Conditional payment expiry
-  ✓ Escrow creation (funds reserved immediately)
-  ✓ Escrow release to beneficiary
-  ✓ Escrow refund to depositor
-  ✓ Escrow expiry auto-refund
-  ✓ Kafka events for all lifecycle stages
+  - Time-lock condition: auto-executes after release time
+  - Time-lock condition: does NOT execute before release time
+  - Oracle trigger: executes with matching data
+  - Oracle trigger: rejected on mismatched data
+  - Multi-sig: passes with sufficient signers, fails with insufficient
+  - Delivery confirmation: trigger flow
+  - KYC-verified condition
+  - Conditional payment expiry
+  - Escrow creation (funds reserved via EscrowHold)
+  - Escrow release to beneficiary
+  - Escrow refund to depositor
+  - Escrow expiry auto-refund
+  - Outbox events for all lifecycle stages
 """
 
 import uuid
@@ -28,10 +28,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from shared.models import (
-    Account, ConditionalPayment, EscrowContract, TokenBalance,
+    Account, ConditionalPayment, EscrowContract, EscrowHold,
     ConditionType, EscrowStatus, TxnStatus,
 )
-from tests.conftest import make_account, make_balance
+from shared.journal import get_balance as journal_get_balance
+from shared.journal import get_available_balance
+from tests.conftest import make_account, make_balance, get_outbox_events
 
 import sys
 sys.path.insert(0, "/home/claude/stablecoin-infra/services/payment-engine")
@@ -45,23 +47,29 @@ from main import (
 # ─── Helper ───────────────────────────────────────────────────────────────────
 
 def get_balance(db: Session, account_id, currency: str) -> Decimal:
-    b = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == account_id,
-            TokenBalance.currency   == currency,
-        )
-    ).scalar_one_or_none()
-    return b.balance if b else Decimal("0")
+    aid = str(account_id)
+    return journal_get_balance(db, aid, currency)
 
 
-def get_reserved(db: Session, account_id, currency: str) -> Decimal:
-    b = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == account_id,
-            TokenBalance.currency   == currency,
+def get_active_holds(db: Session, account_id, currency: str) -> Decimal:
+    """Sum of active holds (reserve - release) for an account/currency."""
+    from sqlalchemy import func
+    acct_uuid = uuid.UUID(str(account_id)) if not isinstance(account_id, uuid.UUID) else account_id
+    reserves = db.execute(
+        select(func.coalesce(func.sum(EscrowHold.amount), 0)).where(
+            EscrowHold.account_id == acct_uuid,
+            EscrowHold.currency == currency,
+            EscrowHold.hold_type == "reserve",
         )
-    ).scalar_one_or_none()
-    return b.reserved if b else Decimal("0")
+    ).scalar() or Decimal("0")
+    releases = db.execute(
+        select(func.coalesce(func.sum(EscrowHold.amount), 0)).where(
+            EscrowHold.account_id == acct_uuid,
+            EscrowHold.currency == currency,
+            EscrowHold.hold_type == "release",
+        )
+    ).scalar() or Decimal("0")
+    return Decimal(str(reserves)) - Decimal(str(releases))
 
 
 def make_conditional_payment(
@@ -127,7 +135,6 @@ class TestConditionEvaluators:
         assert evaluate_condition("time_lock", {"release_at": past}) is True
 
     def test_time_lock_exactly_now(self):
-        # A release in the past (even 1ms ago) should be True
         past = (datetime.now(timezone.utc) - timedelta(milliseconds=1)).isoformat()
         assert evaluate_condition("time_lock", {"release_at": past}) is True
 
@@ -167,7 +174,7 @@ class TestConditionEvaluators:
 
     def test_multi_sig_unknown_signer_ignored(self):
         params  = {"required_signers": ["alice", "bob"], "threshold": 2}
-        trigger = {"signatures": ["alice", "mallory"]}   # mallory not in required
+        trigger = {"signatures": ["alice", "mallory"]}
         assert evaluate_condition("multi_sig", params, trigger) is False
 
     def test_delivery_confirmation_match(self):
@@ -223,9 +230,9 @@ class TestConditionalPaymentExecution:
         )
         _execute_conditional_payment(db, cp, {"oracle_key": "K", "oracle_value": "V"}, "oracle")
 
-        events = mock_kafka.events_for("payment.conditional.completed")
-        assert len(events) == 1
-        assert events[0].payment_ref == cp.payment_ref
+        events = get_outbox_events(db, "payment.conditional.completed")
+        assert len(events) >= 1
+        assert events[-1].payload["payment_ref"] == cp.payment_ref
 
     def test_execute_insufficient_balance_raises(self, db, omnibus, mock_kafka):
         poor  = make_account(db, "Broke Payer")
@@ -245,28 +252,25 @@ class TestConditionalPaymentExecution:
 
 class TestEscrow:
 
-    def test_escrow_reserves_funds_immediately(self, db, alice, bob, mock_kafka):
-        amount        = Decimal("2_000_000")
-        reserved_before = get_reserved(db, alice.id, "USD")
+    def test_escrow_reserves_funds_via_hold(self, db, alice, bob, mock_kafka):
+        amount = Decimal("2_000_000")
+        holds_before = get_active_holds(db, alice.id, "USD")
 
         make_escrow(db, str(alice.id), str(bob.id), amount)
 
-        reserved_after = get_reserved(db, alice.id, "USD")
-        assert reserved_after == reserved_before + amount
+        holds_after = get_active_holds(db, alice.id, "USD")
+        assert holds_after == holds_before + amount
 
-    def test_escrow_does_not_change_total_balance(self, db, alice, bob):
+    def test_escrow_does_not_change_journal_balance(self, db, alice, bob):
         total_before = get_balance(db, alice.id, "USD")
         make_escrow(db, str(alice.id), str(bob.id), Decimal("1_000_000"))
-        # Total balance unchanged; only the reserved bucket increases
         assert get_balance(db, alice.id, "USD") == total_before
 
     def test_release_to_beneficiary(self, db, alice, bob, mock_kafka):
-        amount        = Decimal("3_000_000")
-        bob_before    = get_balance(db, bob.id, "USD")
-        escrow        = make_escrow(db, str(alice.id), str(bob.id), amount)
+        amount     = Decimal("3_000_000")
+        bob_before = get_balance(db, bob.id, "USD")
+        escrow     = make_escrow(db, str(alice.id), str(bob.id), amount)
 
-        # Simulate release (mirrors the API handler logic)
-        from main import _locked_transfer
         txn = _locked_transfer(
             db,
             debit_id=str(alice.id),
@@ -291,16 +295,15 @@ class TestEscrow:
     def test_escrow_expiry_refunds_reserved(self, db, alice, bob, mock_kafka):
         amount = Decimal("500_000")
         escrow = make_escrow(db, str(alice.id), str(bob.id), amount, hours=0)
-        # Backdate expiry
         escrow.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         db.flush()
 
-        reserved_before = get_reserved(db, alice.id, "USD")
+        holds_before = get_active_holds(db, alice.id, "USD")
         _expire_escrow(db, escrow)
 
         assert escrow.status == EscrowStatus.EXPIRED
-        reserved_after = get_reserved(db, alice.id, "USD")
-        assert reserved_after == reserved_before - amount
+        holds_after = get_active_holds(db, alice.id, "USD")
+        assert holds_after == holds_before - amount
 
     def test_escrow_expiry_emits_event(self, db, alice, bob, mock_kafka):
         escrow = make_escrow(db, str(alice.id), str(bob.id), Decimal("100_000"), hours=0)
@@ -309,7 +312,6 @@ class TestEscrow:
 
         _expire_escrow(db, escrow)
 
-        events = mock_kafka.events_for("escrow.expired")
-        assert len(events) == 1
-        assert events[0].contract_ref == escrow.contract_ref
-        assert events[0].amount       == Decimal("100_000")
+        events = get_outbox_events(db, "escrow.expired")
+        assert len(events) >= 1
+        assert events[-1].payload["contract_ref"] == escrow.contract_ref

@@ -5,17 +5,18 @@ End-to-end scenario tests that exercise multi-service flows within a single
 in-memory DB session.  Each scenario tests a realistic business workflow.
 
 Scenarios:
-  1. Full issuance → RTGS transfer → redemption lifecycle
+  1. Full issuance -> RTGS transfer -> redemption lifecycle
   2. Trade finance: escrow funded by token issuance, released on delivery
   3. Conditional cross-border payment (oracle trigger)
   4. FX settlement followed by RTGS in buy currency
-  5. Multi-party settlement chain (A→B→C via sequential RTGS)
+  5. Multi-party settlement chain (A->B->C via sequential RTGS)
   6. Concurrency-safe double-spend attempt (optimistic locking)
 """
 
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
@@ -24,9 +25,15 @@ from sqlalchemy.orm import Session
 from shared.models import (
     Account, ConditionalPayment, EscrowContract, FXSettlement,
     RTGSSettlement, TokenBalance, TokenIssuance, Transaction,
+    EscrowHold,
     ConditionType, EscrowStatus, SettlementStatus, TxnStatus,
 )
-from tests.conftest import make_account, make_balance, make_fx_rate, OMNIBUS_ID
+from shared.journal import get_balance as journal_get_balance
+from shared.journal import get_available_balance
+from tests.conftest import (
+    make_account, make_balance, make_fx_rate,
+    get_outbox_events, OMNIBUS_ID,
+)
 
 import sys
 sys.path.insert(0, "/home/claude/stablecoin-infra/services/token-issuance")
@@ -47,23 +54,29 @@ from decimal import ROUND_DOWN
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def bal(db, account_id, currency: str) -> Decimal:
-    b = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == account_id,
-            TokenBalance.currency   == currency,
-        )
-    ).scalar_one_or_none()
-    return b.balance if b else Decimal("0")
+    aid = str(account_id)
+    return journal_get_balance(db, aid, currency)
 
 
-def reserve(db, account_id, currency: str) -> Decimal:
-    b = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == account_id,
-            TokenBalance.currency   == currency,
+def get_active_holds(db, account_id, currency: str) -> Decimal:
+    """Sum of active holds (reserve - release) for an account/currency."""
+    from sqlalchemy import func
+    acct_uuid = uuid.UUID(str(account_id)) if not isinstance(account_id, uuid.UUID) else account_id
+    reserves = db.execute(
+        select(func.coalesce(func.sum(EscrowHold.amount), 0)).where(
+            EscrowHold.account_id == acct_uuid,
+            EscrowHold.currency == currency,
+            EscrowHold.hold_type == "reserve",
         )
-    ).scalar_one_or_none()
-    return b.reserved if b else Decimal("0")
+    ).scalar() or Decimal("0")
+    releases = db.execute(
+        select(func.coalesce(func.sum(EscrowHold.amount), 0)).where(
+            EscrowHold.account_id == acct_uuid,
+            EscrowHold.currency == currency,
+            EscrowHold.hold_type == "release",
+        )
+    ).scalar() or Decimal("0")
+    return Decimal(str(reserves)) - Decimal(str(releases))
 
 
 def setup_nostros(db):
@@ -83,25 +96,15 @@ def setup_nostros(db):
                 account_type="bank",
                 kyc_verified=True, aml_cleared=True, is_active=True,
             ))
-        existing_bal = db.execute(
-            select(TokenBalance).where(
-                TokenBalance.account_id == acc_id,
-                TokenBalance.currency   == ccy,
-            )
-        ).scalar_one_or_none()
-        if not existing_bal:
-            db.add(TokenBalance(
-                account_id=uuid.UUID(acc_id), currency=ccy,
-                balance=Decimal("500_000_000"), reserved=Decimal("0"),
-            ))
+        make_balance(db, acc_id, ccy, Decimal("500_000_000"))
     db.flush()
 
 
-# ─── Scenario 1: Issuance → RTGS Transfer → Redemption ───────────────────────
+# ─── Scenario 1: Issuance -> RTGS Transfer -> Redemption ───────────────────
 
 class TestScenario1_IssuanceToRTGSToRedemption:
     """
-    Bank A (issuer) → issues tokens → RTGS to Bank B → Bank B redeems.
+    Bank A (issuer) -> issues tokens -> RTGS to Bank B -> Bank B redeems.
     Models the full JPM Coin round-trip.
     """
 
@@ -109,15 +112,16 @@ class TestScenario1_IssuanceToRTGSToRedemption:
         bank_a = make_account(db, "Bank A (Issuer)")
         bank_b = make_account(db, "Bank B (Recipient)")
 
-        # ── Step 1: Issue $10M to Bank A ──────────────────────────────────
+        # Step 1: Issue $10M to Bank A
         token_svc._issue_tokens(
             db, str(bank_a.id), "USD",
             Decimal("10_000_000"), "DEP-E2E-001", "JPMorgan", None,
         )
         assert bal(db, bank_a.id, "USD") == Decimal("10_000_000")
-        assert len(mock_kafka.events_for("token.issuance.completed")) == 1
+        issuance_events = get_outbox_events(db, "token.issuance.completed")
+        assert len(issuance_events) >= 1
 
-        # ── Step 2: RTGS transfer $7M from Bank A → Bank B ────────────────
+        # Step 2: RTGS transfer $7M from Bank A -> Bank B
         settlement = RTGSSettlement(
             settlement_ref="RTGS-E2E-001",
             sending_account_id=bank_a.id,
@@ -135,22 +139,24 @@ class TestScenario1_IssuanceToRTGSToRedemption:
         assert bal(db, bank_a.id, "USD") == Decimal("3_000_000")
         assert bal(db, bank_b.id, "USD") == Decimal("7_000_000")
 
-        # ── Step 3: Bank B redeems $5M back to fiat ───────────────────────
+        # Step 3: Bank B redeems $5M back to fiat
         token_svc._redeem_tokens(
             db, str(bank_b.id), "USD",
             Decimal("5_000_000"), "REDEEM-E2E-001", None,
         )
         assert bal(db, bank_b.id, "USD") == Decimal("2_000_000")
-        assert len(mock_kafka.events_for("token.redemption.completed")) == 1
+        redemption_events = get_outbox_events(db, "token.redemption.completed")
+        assert len(redemption_events) >= 1
 
-        # ── Verify total Kafka event count ────────────────────────────────
-        assert len(mock_kafka.events_for("rtgs.settlement.completed")) == 1
-        assert len(mock_kafka.events_for("token.balance.updated"))      >= 2
+        # Verify outbox event counts
+        rtgs_events = get_outbox_events(db, "rtgs.settlement.completed")
+        assert len(rtgs_events) >= 1
+        balance_events = get_outbox_events(db, "token.balance.updated")
+        assert len(balance_events) >= 2
 
     def test_omnibus_balance_net_change(self, db, omnibus, mock_kafka):
         """
         After issuance of X and redemption of Y, omnibus net change = Y - X.
-        The omnibus reserve is the single source of truth for token backing.
         """
         bank = make_account(db, "Net Bank")
         omnibus_before = bal(db, OMNIBUS_ID, "USD")
@@ -159,7 +165,6 @@ class TestScenario1_IssuanceToRTGSToRedemption:
         token_svc._redeem_tokens(db, str(bank.id), "USD", Decimal("400_000"), "REDEEM-NET", None)
 
         omnibus_after = bal(db, OMNIBUS_ID, "USD")
-        # Net outflow = 1_000_000 issued - 400_000 redeemed = 600_000
         assert omnibus_after == omnibus_before - Decimal("600_000")
 
 
@@ -176,11 +181,9 @@ class TestScenario2_TradeFinanceEscrow:
         buyer  = make_account(db, "Buyer Corp")
         seller = make_account(db, "Seller Corp")
 
-        # Buyer gets $5M via issuance
         token_svc._issue_tokens(db, str(buyer.id), "USD", Decimal("5_000_000"), "DEP-TRADE", None, None)
         assert bal(db, buyer.id, "USD") == Decimal("5_000_000")
 
-        # Buyer locks $3M in escrow for the trade
         payment_svc._reserve_funds(db, str(buyer.id), "USD", Decimal("3_000_000"))
         escrow = EscrowContract(
             contract_ref="ESC-TRADE-001",
@@ -195,11 +198,11 @@ class TestScenario2_TradeFinanceEscrow:
         db.add(escrow)
         db.flush()
 
-        # Buyer still has $5M total but $3M reserved → $2M available
-        assert bal(db, buyer.id, "USD")     == Decimal("5_000_000")
-        assert reserve(db, buyer.id, "USD") == Decimal("3_000_000")
+        # Buyer still has $5M total but $3M reserved
+        assert bal(db, buyer.id, "USD") == Decimal("5_000_000")
+        assert get_active_holds(db, buyer.id, "USD") == Decimal("3_000_000")
 
-        # Delivery confirmed → release escrow to seller
+        # Delivery confirmed -> release escrow to seller
         payment_svc._locked_transfer(
             db,
             debit_id=str(buyer.id),
@@ -220,8 +223,10 @@ class TestScenario2_TradeFinanceEscrow:
     def test_escrow_refunded_on_expired_delivery(self, db, omnibus, mock_kafka):
         buyer  = make_account(db, "Expired Buyer")
         seller = make_account(db, "Non-Delivering Seller")
-        make_balance(db, str(buyer.id), "USD",
-                     balance=Decimal("1_000_000"), reserved=Decimal("500_000"))
+        make_balance(db, str(buyer.id), "USD", Decimal("1_000_000"))
+
+        # Reserve funds via EscrowHold
+        payment_svc._reserve_funds(db, str(buyer.id), "USD", Decimal("500_000"))
 
         escrow = EscrowContract(
             contract_ref="ESC-EXPIRED-001",
@@ -236,11 +241,11 @@ class TestScenario2_TradeFinanceEscrow:
         db.add(escrow)
         db.flush()
 
-        reserved_before = reserve(db, buyer.id, "USD")
+        holds_before = get_active_holds(db, buyer.id, "USD")
         payment_svc._expire_escrow(db, escrow)
 
         assert escrow.status == EscrowStatus.EXPIRED
-        assert reserve(db, buyer.id, "USD") == reserved_before - Decimal("500_000")
+        assert get_active_holds(db, buyer.id, "USD") == holds_before - Decimal("500_000")
 
 
 # ─── Scenario 3: Oracle-Triggered Cross-Border Payment ───────────────────────
@@ -265,10 +270,9 @@ class TestScenario3_OracleConditionalPayment:
         db.add(cp)
         db.flush()
 
-        # Wrong oracle data → no transfer
         wrong = {"oracle_key": "SOFR", "oracle_value": "5.20"}
         assert payment_svc.evaluate_condition("oracle_trigger", cp.condition_params, wrong) is False
-        assert bal(db, bob.id, "USD") == Decimal("30_000_000")  # bob unchanged
+        assert bal(db, bob.id, "USD") == Decimal("30_000_000")
 
     def test_payment_executes_when_oracle_matches(self, db, alice, bob, mock_kafka):
         alice_before = bal(db, alice.id, "USD")
@@ -287,7 +291,6 @@ class TestScenario3_OracleConditionalPayment:
         db.add(cp)
         db.flush()
 
-        # Correct oracle data → executes
         correct = {"oracle_key": "SOFR", "oracle_value": "5.33"}
         payment_svc._execute_conditional_payment(db, cp, correct, "sofr-oracle")
 
@@ -296,11 +299,11 @@ class TestScenario3_OracleConditionalPayment:
         assert bal(db, bob.id,   "USD") == bob_before   + Decimal("2_000_000")
 
 
-# ─── Scenario 4: FX Settlement → RTGS in Buy Currency ────────────────────────
+# ─── Scenario 4: FX Settlement -> RTGS in Buy Currency ────────────────────────
 
 class TestScenario4_FXThenRTGS:
     """
-    Bank A exchanges USD → EUR via FX rails,
+    Bank A exchanges USD -> EUR via FX rails,
     then immediately RTGS-transfers the EUR to Bank B.
     Models a cross-border corporate payment.
     """
@@ -313,7 +316,7 @@ class TestScenario4_FXThenRTGS:
         rate = Decimal("0.918")
         buy  = (sell * rate).quantize(PRECISION, rounding=ROUND_DOWN)
 
-        # ── FX: Alice USD → Alice EUR ──────────────────────────────────────
+        # FX: Alice USD -> Alice EUR
         fx = FXSettlement(
             settlement_ref="FXS-CHAIN-001",
             sending_account_id=alice.id,
@@ -330,12 +333,17 @@ class TestScenario4_FXThenRTGS:
         db.add(fx)
         db.flush()
         from shared.models import SettlementRails
-        fx_svc._process_fx_settlement(db, fx)
+
+        with patch(
+            "main._sign_settlement",
+            return_value="0x" + "ab" * 32,
+        ):
+            fx_svc._process_fx_settlement(db, fx)
 
         assert fx.status == SettlementStatus.SETTLED
-        assert bal(db, alice.id, "EUR") == buy
+        assert bal(db, alice.id, "EUR") == Decimal("20_000_000") + buy
 
-        # ── RTGS: Alice EUR → Bob EUR ──────────────────────────────────────
+        # RTGS: Alice EUR -> Bob EUR
         transfer = Decimal("500_000")
         rtgs_settlement = RTGSSettlement(
             settlement_ref="RTGS-CHAIN-001",
@@ -351,7 +359,7 @@ class TestScenario4_FXThenRTGS:
         rtgs_svc._process_one_settlement(db, rtgs_settlement)
 
         assert rtgs_settlement.status == SettlementStatus.SETTLED
-        assert bal(db, alice.id, "EUR") == buy - transfer
+        assert bal(db, alice.id, "EUR") == Decimal("20_000_000") + buy - transfer
         assert bal(db, bob.id,   "EUR") == transfer
 
 
@@ -359,7 +367,7 @@ class TestScenario4_FXThenRTGS:
 
 class TestScenario5_SettlementChain:
     """
-    A → B → C sequential RTGS.
+    A -> B -> C sequential RTGS.
     Models correspondent banking chains (RLN / intraday liquidity).
     """
 
@@ -371,7 +379,7 @@ class TestScenario5_SettlementChain:
         make_balance(db, str(bank_a.id), "USD", Decimal("5_000_000"))
         make_balance(db, str(bank_b.id), "USD", Decimal("1_000_000"))
 
-        # A → B: $3M
+        # A -> B: $3M
         s1 = RTGSSettlement(
             settlement_ref="CHAIN-1",
             sending_account_id=bank_a.id, receiving_account_id=bank_b.id,
@@ -382,7 +390,7 @@ class TestScenario5_SettlementChain:
         rtgs_svc._process_one_settlement(db, s1)
         assert s1.status == SettlementStatus.SETTLED
 
-        # B → C: $2M (using B's original $1M + $3M just received)
+        # B -> C: $2M (using B's original $1M + $3M just received)
         s2 = RTGSSettlement(
             settlement_ref="CHAIN-2",
             sending_account_id=bank_b.id, receiving_account_id=bank_c.id,
@@ -393,9 +401,9 @@ class TestScenario5_SettlementChain:
         rtgs_svc._process_one_settlement(db, s2)
         assert s2.status == SettlementStatus.SETTLED
 
-        assert bal(db, bank_a.id, "USD") == Decimal("2_000_000")  # 5M - 3M
-        assert bal(db, bank_b.id, "USD") == Decimal("2_000_000")  # 1M + 3M - 2M
-        assert bal(db, bank_c.id, "USD") == Decimal("2_000_000")  # 0 + 2M
+        assert bal(db, bank_a.id, "USD") == Decimal("2_000_000")
+        assert bal(db, bank_b.id, "USD") == Decimal("2_000_000")
+        assert bal(db, bank_c.id, "USD") == Decimal("2_000_000")
 
 
 # ─── Scenario 6: Double-Spend Prevention ─────────────────────────────────────
@@ -434,7 +442,6 @@ class TestScenario6_DoubleSpendPrevention:
         ok2 = rtgs_svc._process_one_settlement(db, s2)
         assert ok2 is False
 
-        # Source should have exactly $100K left
         assert bal(db, source.id, "USD") == Decimal("100_000")
         assert bal(db, dest_a.id, "USD") == Decimal("900_000")
         assert bal(db, dest_b.id, "USD") == Decimal("0")

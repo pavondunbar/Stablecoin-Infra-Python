@@ -36,6 +36,7 @@ from models import Account, ComplianceEvent as ComplianceEventModel
 import kafka_client as kafka
 from metrics import instrument_app
 from events import ComplianceEvent, AuditTrailEntry
+from outbox import insert_outbox_event
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -196,20 +197,29 @@ def _run_screening(
 
     _write_compliance_event(entity_type, entity_id, event_type, result, score, details)
 
-    # Publish to compliance.event topic
-    kafka.publish(
-        "compliance.event",
-        ComplianceEvent(
-            service=SERVICE,
-            entity_type=entity_type,
-            entity_id=entity_id,
-            event_type=event_type,
-            result=result,
-            score=score,
-            details=details,
-        ),
-        key=entity_id,
-    )
+    # Publish compliance result via transactional outbox
+    outbox_db = SessionLocal()
+    try:
+        insert_outbox_event(
+            outbox_db,
+            aggregate_id=entity_id,
+            event_type="compliance.event",
+            event=ComplianceEvent(
+                service=SERVICE,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                event_type=event_type,
+                result=result,
+                score=score,
+                details=details,
+            ),
+        )
+        outbox_db.commit()
+    except Exception as exc:
+        outbox_db.rollback()
+        log.error("Failed to insert outbox event: %s", exc)
+    finally:
+        outbox_db.close()
 
     if result == "fail":
         _stats["alerts_raised"] += 1

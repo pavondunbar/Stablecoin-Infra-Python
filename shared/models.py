@@ -10,8 +10,8 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, Column, Date, DateTime,
-    Enum, ForeignKey, Index, Numeric, SmallInteger, String, Text,
-    UniqueConstraint,
+    Enum, ForeignKey, Index, Integer, Numeric, SmallInteger, String,
+    Text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -75,6 +75,19 @@ class ConditionType(str, enum.Enum):
     DELIVERY_CONFIRMATION = "delivery_confirmation"
     KYC_VERIFIED          = "kyc_verified"
 
+class NormalBalance(str, enum.Enum):
+    DEBIT  = "debit"
+    CREDIT = "credit"
+
+class COAAccountType(str, enum.Enum):
+    ASSET     = "asset"
+    LIABILITY = "liability"
+    REVENUE   = "revenue"
+
+class HoldType(str, enum.Enum):
+    RESERVE = "reserve"
+    RELEASE = "release"
+
 
 # ─── Base ─────────────────────────────────────────────────────────────────────
 
@@ -103,7 +116,7 @@ class Account(Base):
     token_balances = relationship("TokenBalance", back_populates="account", lazy="selectin")
 
 
-# ─── TokenBalance ─────────────────────────────────────────────────────────────
+# ─── TokenBalance (legacy — replaced by account_balances VIEW) ───────────────
 
 class TokenBalance(Base):
     __tablename__ = "token_balances"
@@ -125,20 +138,142 @@ class TokenBalance(Base):
         return self.balance - self.reserved
 
 
-# ─── LedgerEntry ─────────────────────────────────────────────────────────────
+# ─── LedgerEntry (legacy — replaced by JournalEntry) ────────────────────────
 
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
 
     id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     txn_ref       = Column(String(64), nullable=False)
-    entry_type    = Column(String(20), nullable=False)      # debit | credit
+    entry_type    = Column(String(20), nullable=False)
     account_id    = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
     currency      = Column(Enum(CurrencyCode, name="currency_code", values_callable=lambda e: [x.value for x in e]), nullable=False)
     amount        = Column(Numeric(28, 8), nullable=False)
     balance_after = Column(Numeric(28, 8), nullable=False)
     narrative     = Column(Text)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ─── ChartOfAccounts ─────────────────────────────────────────────────────────
+
+class ChartOfAccounts(Base):
+    __tablename__ = "chart_of_accounts"
+
+    code           = Column(String(30), primary_key=True)
+    name           = Column(String(255), nullable=False)
+    account_type   = Column(String(20), nullable=False)
+    normal_balance = Column(String(10), nullable=False)
+
+
+# ─── JournalEntry (replaces LedgerEntry — append-only) ──────────────────────
+
+class JournalEntry(Base):
+    __tablename__ = "journal_entries"
+
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    journal_id   = Column(UUID(as_uuid=True), nullable=False, index=True)
+    account_id   = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
+    coa_code     = Column(String(30), ForeignKey("chart_of_accounts.code"), nullable=False)
+    currency     = Column(String(10), nullable=False)
+    debit        = Column(Numeric(38, 18), nullable=False, default=Decimal("0"))
+    credit       = Column(Numeric(38, 18), nullable=False, default=Decimal("0"))
+    entry_type   = Column(String(50), nullable=False)
+    reference_id = Column(UUID(as_uuid=True), index=True)
+    narrative    = Column(Text)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ─── OutboxEvent (transactional outbox) ──────────────────────────────────────
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    aggregate_id = Column(String(255), nullable=False)
+    event_type   = Column(String(255), nullable=False)
+    payload      = Column(JSONB, nullable=False)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    published_at = Column(DateTime(timezone=True))
+
+
+# ─── EscrowHold (append-only holds for reserved funds) ──────────────────────
+
+class EscrowHold(Base):
+    __tablename__ = "escrow_holds"
+
+    id                  = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hold_ref            = Column(String(64), nullable=False, index=True)
+    account_id          = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
+    currency            = Column(String(10), nullable=False)
+    amount              = Column(Numeric(38, 18), nullable=False)
+    hold_type           = Column(String(10), nullable=False)
+    related_entity_type = Column(String(50))
+    related_entity_id   = Column(UUID(as_uuid=True))
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ─── Status History Models ───────────────────────────────────────────────────
+
+class TransactionStatusHistory(Base):
+    __tablename__ = "transaction_status_history"
+
+    id             = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    transaction_id = Column(UUID(as_uuid=True), ForeignKey("transactions.id"), nullable=False, index=True)
+    status         = Column(String(20), nullable=False)
+    detail         = Column(JSONB)
+    tx_hash        = Column(String(255))
+    block_number   = Column(BigInteger)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class RTGSSettlementStatusHistory(Base):
+    __tablename__ = "rtgs_settlement_status_history"
+
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    settlement_id = Column(UUID(as_uuid=True), ForeignKey("rtgs_settlements.id"), nullable=False, index=True)
+    status        = Column(String(20), nullable=False)
+    detail        = Column(JSONB)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class FXSettlementStatusHistory(Base):
+    __tablename__ = "fx_settlement_status_history"
+
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    settlement_id = Column(UUID(as_uuid=True), ForeignKey("fx_settlements.id"), nullable=False, index=True)
+    status        = Column(String(20), nullable=False)
+    detail        = Column(JSONB)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class EscrowStatusHistory(Base):
+    __tablename__ = "escrow_status_history"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    escrow_id  = Column(UUID(as_uuid=True), ForeignKey("escrow_contracts.id"), nullable=False, index=True)
+    status     = Column(String(20), nullable=False)
+    detail     = Column(JSONB)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ConditionalPaymentStatusHistory(Base):
+    __tablename__ = "conditional_payment_status_history"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    payment_id = Column(UUID(as_uuid=True), ForeignKey("conditional_payments.id"), nullable=False, index=True)
+    status     = Column(String(20), nullable=False)
+    detail     = Column(JSONB)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class TokenIssuanceStatusHistory(Base):
+    __tablename__ = "token_issuance_status_history"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    issuance_id = Column(UUID(as_uuid=True), ForeignKey("token_issuances.id"), nullable=False, index=True)
+    status      = Column(String(20), nullable=False)
+    detail      = Column(JSONB)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
 
 
 # ─── TokenIssuance ────────────────────────────────────────────────────────────
@@ -265,8 +400,6 @@ class FXRate(Base):
     valid_from     = Column(DateTime(timezone=True), server_default=func.now())
     valid_until    = Column(DateTime(timezone=True))
 
-
-# ─── FXSettlement ─────────────────────────────────────────────────────────────
 
 # ─── ComplianceEvent ──────────────────────────────────────────────────────────
 

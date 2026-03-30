@@ -48,6 +48,19 @@ from events import (
     ConditionalPaymentCreated, ConditionalPaymentTriggered, ConditionalPaymentCompleted,
     EscrowCreated, EscrowReleased, EscrowExpired, AuditTrailEntry,
 )
+from shared.journal import (
+    record_journal_pair,
+    get_balance as journal_get_balance,
+    get_available_balance,
+    acquire_balance_lock,
+)
+from shared.outbox import insert_outbox_event
+from shared.status import record_status
+from shared.models import (
+    EscrowHold, EscrowStatusHistory,
+    ConditionalPaymentStatusHistory,
+    TransactionStatusHistory, JournalEntry,
+)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -112,52 +125,15 @@ def _locked_transfer(
     txn_type: str,
     release_reserve: bool = False,
 ) -> Transaction:
-    send_bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == debit_id,
-            TokenBalance.currency   == currency,
-        ).with_for_update()
-    ).scalar_one_or_none()
+    acquire_balance_lock(db, debit_id, currency)
 
-    if not send_bal:
-        raise ValueError(f"No {currency} balance for {debit_id}")
-
-    if release_reserve:
-        # Release from reserved bucket
-        if send_bal.reserved < amount:
-            raise ValueError("Insufficient reserved balance")
-        send_bal.reserved -= amount
-        send_bal.balance  -= amount          # reserved was already subtracted from available
-    else:
-        if send_bal.available < amount:
-            raise ValueError(f"Insufficient available: {send_bal.available} < {amount}")
-        send_bal.balance -= amount
-
-    send_bal.version += 1
-
-    recv_bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == credit_id,
-            TokenBalance.currency   == currency,
-        ).with_for_update()
-    ).scalar_one_or_none()
-
-    if not recv_bal:
-        recv_bal = TokenBalance(account_id=credit_id, currency=currency,
-                                balance=Decimal("0"), reserved=Decimal("0"))
-        db.add(recv_bal)
-        db.flush()
-
-    recv_bal.balance += amount
-    recv_bal.version += 1
+    available = get_available_balance(db, debit_id, currency)
+    if not release_reserve and available < amount:
+        raise ValueError(
+            f"Insufficient available: {available} < {amount}"
+        )
 
     ref = f"PE-{uuid.uuid4().hex[:16].upper()}"
-    db.add(LedgerEntry(txn_ref=ref, entry_type="debit",  account_id=debit_id,
-                       currency=currency, amount=amount, balance_after=send_bal.balance,
-                       narrative=narrative))
-    db.add(LedgerEntry(txn_ref=ref, entry_type="credit", account_id=credit_id,
-                       currency=currency, amount=amount, balance_after=recv_bal.balance,
-                       narrative=narrative))
 
     txn = Transaction(
         txn_ref=ref,
@@ -171,23 +147,67 @@ def _locked_transfer(
     )
     db.add(txn)
     db.flush()
+
+    record_journal_pair(
+        db,
+        account_id=debit_id,
+        coa_code="INSTITUTION_LIABILITY",
+        currency=currency,
+        amount=amount,
+        entry_type=txn_type,
+        reference_id=str(txn.id),
+        counter_account_id=credit_id,
+        counter_coa_code="INSTITUTION_LIABILITY",
+        narrative=narrative,
+    )
+
+    if release_reserve:
+        hold = EscrowHold(
+            hold_ref=f"REL-{uuid.uuid4().hex[:12]}",
+            account_id=uuid.UUID(debit_id),
+            currency=currency,
+            amount=amount,
+            hold_type="release",
+            related_entity_type="escrow",
+        )
+        db.add(hold)
+        # SQLite compat: also decrement legacy TokenBalance.reserved
+        send_bal = db.execute(
+            select(TokenBalance).where(
+                TokenBalance.account_id == debit_id,
+                TokenBalance.currency == currency,
+            ).with_for_update()
+        ).scalar_one_or_none()
+        if send_bal:
+            send_bal.reserved -= min(amount, send_bal.reserved)
+            send_bal.version += 1
+
+    db.flush()
     return txn
 
 
-def _reserve_funds(db: Session, account_id: str, currency: str, amount: Decimal) -> None:
-    """Move funds from available to reserved (locks them for escrow/conditional payment)."""
-    bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == account_id,
-            TokenBalance.currency   == currency,
-        ).with_for_update()
-    ).scalar_one_or_none()
+def _reserve_funds(
+    db: Session,
+    account_id: str,
+    currency: str,
+    amount: Decimal,
+) -> None:
+    """Create an EscrowHold to reserve funds for escrow/conditional payment."""
+    available = get_available_balance(db, account_id, currency)
+    if available < amount:
+        raise ValueError(
+            f"Insufficient available balance to reserve: {available}"
+        )
 
-    if not bal or bal.available < amount:
-        raise ValueError(f"Insufficient available balance to reserve: {getattr(bal, 'available', 0)}")
-
-    bal.reserved += amount
-    bal.version  += 1
+    hold = EscrowHold(
+        hold_ref=f"HOLD-{uuid.uuid4().hex[:12]}",
+        account_id=uuid.UUID(account_id),
+        currency=currency,
+        amount=amount,
+        hold_type="reserve",
+        related_entity_type="escrow",
+    )
+    db.add(hold)
     db.flush()
 
 
@@ -251,6 +271,12 @@ def _check_conditions():
                     if cp.expires_at and now > cp.expires_at:
                         cp.status = TxnStatus.FAILED
                         db.flush()
+                        record_status(
+                            db, ConditionalPaymentStatusHistory,
+                            "payment_id", cp.id,
+                            TxnStatus.FAILED.value,
+                            detail={"reason": "expired"},
+                        )
                         log.info("Conditional payment expired: %s", cp.payment_ref)
                         continue
 
@@ -290,9 +316,14 @@ def _execute_conditional_payment(
     trigger_data: dict,
     triggered_by: str,
 ) -> Transaction:
-    cp.status      = TxnStatus.PROCESSING
+    cp.status = TxnStatus.PROCESSING
     cp.trigger_data = trigger_data
     db.flush()
+    record_status(
+        db, ConditionalPaymentStatusHistory,
+        "payment_id", cp.id, TxnStatus.PROCESSING.value,
+        detail={"triggered_by": triggered_by},
+    )
 
     txn = _locked_transfer(
         db,
@@ -300,24 +331,32 @@ def _execute_conditional_payment(
         credit_id=str(cp.payee_account_id),
         currency=cp.currency.value,
         amount=cp.amount,
-        narrative=f"Conditional payment {cp.payment_ref} triggered by {triggered_by}",
+        narrative=(
+            f"Conditional payment {cp.payment_ref}"
+            f" triggered by {triggered_by}"
+        ),
         txn_type="conditional_payment",
     )
 
-    cp.status         = TxnStatus.COMPLETED
-    cp.executed_at    = datetime.now(timezone.utc)
+    cp.status = TxnStatus.COMPLETED
+    cp.executed_at = datetime.now(timezone.utc)
     cp.transaction_id = txn.id
     db.flush()
+    record_status(
+        db, ConditionalPaymentStatusHistory,
+        "payment_id", cp.id, TxnStatus.COMPLETED.value,
+    )
 
-    kafka.publish(
-        "payment.conditional.completed",
-        ConditionalPaymentCompleted(
+    insert_outbox_event(
+        db,
+        aggregate_id=cp.payment_ref,
+        event_type="payment.conditional.completed",
+        event=ConditionalPaymentCompleted(
             service=SERVICE,
             payment_ref=cp.payment_ref,
             transaction_id=str(txn.id),
             executed_at=cp.executed_at,
         ),
-        key=cp.payment_ref,
     )
     log.info("Conditional payment executed: %s", cp.payment_ref)
     return txn
@@ -325,28 +364,49 @@ def _execute_conditional_payment(
 
 def _expire_escrow(db: Session, escrow: EscrowContract):
     """Refund expired escrow to depositor."""
-    # Release reserved funds back to available
+    depositor_id = str(escrow.depositor_account_id)
+
+    # Insert release hold to free reserved funds
+    hold = EscrowHold(
+        hold_ref=f"REL-{uuid.uuid4().hex[:12]}",
+        account_id=uuid.UUID(depositor_id),
+        currency=escrow.currency.value
+        if hasattr(escrow.currency, "value")
+        else escrow.currency,
+        amount=escrow.amount,
+        hold_type="release",
+        related_entity_type="escrow",
+        related_entity_id=escrow.id,
+    )
+    db.add(hold)
+
+    # SQLite compat: also decrement legacy TokenBalance.reserved
     bal = db.execute(
         select(TokenBalance).where(
-            TokenBalance.account_id == str(escrow.depositor_account_id),
-            TokenBalance.currency   == escrow.currency,
+            TokenBalance.account_id == depositor_id,
+            TokenBalance.currency == escrow.currency,
         ).with_for_update()
     ).scalar_one_or_none()
-
     if bal:
         release_amt = min(escrow.amount, bal.reserved)
         bal.reserved -= release_amt
-        bal.version  += 1
+        bal.version += 1
 
     escrow.status = EscrowStatus.EXPIRED
     db.flush()
+    record_status(
+        db, EscrowStatusHistory,
+        "escrow_id", escrow.id, EscrowStatus.EXPIRED.value,
+    )
 
-    kafka.publish(
-        "escrow.expired",
-        EscrowExpired(
+    insert_outbox_event(
+        db,
+        aggregate_id=escrow.contract_ref,
+        event_type="escrow.expired",
+        event=EscrowExpired(
             service=SERVICE,
             contract_ref=escrow.contract_ref,
-            refunded_account_id=str(escrow.depositor_account_id),
+            refunded_account_id=depositor_id,
             amount=escrow.amount,
         ),
     )
@@ -413,10 +473,16 @@ def create_conditional_payment(
     )
     db.add(cp)
     db.flush()
+    record_status(
+        db, ConditionalPaymentStatusHistory,
+        "payment_id", cp.id, TxnStatus.PENDING.value,
+    )
 
-    kafka.publish(
-        "payment.conditional.created",
-        ConditionalPaymentCreated(
+    insert_outbox_event(
+        db,
+        aggregate_id=ref,
+        event_type="payment.conditional.created",
+        event=ConditionalPaymentCreated(
             service=SERVICE,
             payment_ref=ref,
             payer_account_id=req.payer_account_id,
@@ -426,7 +492,6 @@ def create_conditional_payment(
             condition_type=req.condition_type.value,
             condition_params=req.condition_params,
         ),
-        key=ref,
     )
 
     return {
@@ -456,11 +521,15 @@ def trigger_conditional_payment(
     if cp.status != TxnStatus.PENDING:
         raise HTTPException(status_code=409, detail=f"Payment is in state: {cp.status.value}")
 
-    satisfied = evaluate_condition(cp.condition_type.value, cp.condition_params, req.trigger_data)
+    satisfied = evaluate_condition(
+        cp.condition_type.value, cp.condition_params, req.trigger_data,
+    )
     if not satisfied:
-        kafka.publish(
-            "payment.conditional.triggered",
-            ConditionalPaymentTriggered(
+        insert_outbox_event(
+            db,
+            aggregate_id=payment_ref,
+            event_type="payment.conditional.triggered",
+            event=ConditionalPaymentTriggered(
                 service=SERVICE,
                 payment_ref=payment_ref,
                 trigger_data=req.trigger_data,
@@ -535,10 +604,16 @@ def create_escrow(req: CreateEscrowRequest, db: Session = Depends(get_db_session
     escrow.contract_ref = ref
     db.add(escrow)
     db.flush()
+    record_status(
+        db, EscrowStatusHistory,
+        "escrow_id", escrow.id, EscrowStatus.ACTIVE.value,
+    )
 
-    kafka.publish(
-        "escrow.created",
-        EscrowCreated(
+    insert_outbox_event(
+        db,
+        aggregate_id=ref,
+        event_type="escrow.created",
+        event=EscrowCreated(
             service=SERVICE,
             contract_ref=ref,
             depositor_account_id=req.depositor_account_id,
@@ -548,7 +623,6 @@ def create_escrow(req: CreateEscrowRequest, db: Session = Depends(get_db_session
             conditions=req.conditions,
             expires_at=req.expires_at,
         ),
-        key=ref,
     )
 
     return {
@@ -598,15 +672,21 @@ def release_escrow(
             txn_type="escrow_release",
             release_reserve=True,
         )
-        escrow.status            = EscrowStatus.RELEASED
-        escrow.release_txn_id    = txn.id
-        escrow.released_at       = now
+        escrow.status = EscrowStatus.RELEASED
+        escrow.release_txn_id = txn.id
+        escrow.released_at = now
         escrow.release_triggered_by = req.triggered_by
         db.flush()
+        record_status(
+            db, EscrowStatusHistory,
+            "escrow_id", escrow.id, EscrowStatus.RELEASED.value,
+        )
 
-        kafka.publish(
-            "escrow.released",
-            EscrowReleased(
+        insert_outbox_event(
+            db,
+            aggregate_id=contract_ref,
+            event_type="escrow.released",
+            event=EscrowReleased(
                 service=SERVICE,
                 contract_ref=contract_ref,
                 release_txn_id=str(txn.id),
@@ -618,30 +698,55 @@ def release_escrow(
         return {"result": "released_to_beneficiary", "transaction_id": str(txn.id)}
 
     else:  # refund to depositor — un-reserve the funds
+        depositor_id = str(escrow.depositor_account_id)
+        currency_val = (
+            escrow.currency.value
+            if hasattr(escrow.currency, "value")
+            else escrow.currency
+        )
+
+        # Insert release hold to free reserved funds
+        hold = EscrowHold(
+            hold_ref=f"REL-{uuid.uuid4().hex[:12]}",
+            account_id=uuid.UUID(depositor_id),
+            currency=currency_val,
+            amount=escrow.amount,
+            hold_type="release",
+            related_entity_type="escrow",
+            related_entity_id=escrow.id,
+        )
+        db.add(hold)
+
+        # SQLite compat: also decrement legacy TokenBalance.reserved
         bal = db.execute(
             select(TokenBalance).where(
-                TokenBalance.account_id == str(escrow.depositor_account_id),
-                TokenBalance.currency   == escrow.currency,
+                TokenBalance.account_id == depositor_id,
+                TokenBalance.currency == escrow.currency,
             ).with_for_update()
         ).scalar_one_or_none()
-
         if bal:
-            release_amt    = min(escrow.amount, bal.reserved)
-            bal.reserved  -= release_amt
-            bal.version   += 1
+            release_amt = min(escrow.amount, bal.reserved)
+            bal.reserved -= release_amt
+            bal.version += 1
 
-        escrow.status         = EscrowStatus.REFUNDED
-        escrow.released_at    = now
+        escrow.status = EscrowStatus.REFUNDED
+        escrow.released_at = now
         escrow.release_triggered_by = req.triggered_by
         db.flush()
+        record_status(
+            db, EscrowStatusHistory,
+            "escrow_id", escrow.id, EscrowStatus.REFUNDED.value,
+        )
 
-        kafka.publish(
-            "escrow.released",
-            EscrowReleased(
+        insert_outbox_event(
+            db,
+            aggregate_id=contract_ref,
+            event_type="escrow.released",
+            event=EscrowReleased(
                 service=SERVICE,
                 contract_ref=contract_ref,
                 release_txn_id="",
-                released_to=str(escrow.depositor_account_id),
+                released_to=depositor_id,
                 triggered_by=req.triggered_by,
                 amount=escrow.amount,
             ),

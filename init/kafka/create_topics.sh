@@ -57,6 +57,10 @@ create_topic "fx.settlement.failed"        2   86400000
 create_topic "compliance.event"            4   2592000000  # 30 days
 create_topic "audit.trail"                 8   2592000000  # 30 days — immutable log
 
+# ── Signing ──────────────────────────────────────────────────────────────
+create_topic "signing.request"     2
+create_topic "signing.completed"   2
+
 echo ""
 echo "🎉  All Kafka topics created successfully."
 kafka-topics --bootstrap-server "$KAFKA" --list

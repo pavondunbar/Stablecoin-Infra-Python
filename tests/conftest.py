@@ -33,12 +33,32 @@ os.environ.setdefault("RTGS_URL",           "http://rtgs:8002")
 os.environ.setdefault("PAYMENT_ENGINE_URL", "http://payment-engine:8003")
 os.environ.setdefault("FX_SETTLEMENT_URL",  "http://fx-settlement:8004")
 os.environ.setdefault("COMPLIANCE_URL",     "http://compliance-monitor:8005")
+os.environ.setdefault("SIGNING_GATEWAY_URL", "http://signing-gateway:8006")
 
-from shared.models import Base, Account, TokenBalance, FXRate
+from shared.models import (
+    Base, Account, TokenBalance, FXRate, ChartOfAccounts,
+    JournalEntry, OutboxEvent, EscrowHold,
+    TransactionStatusHistory, RTGSSettlementStatusHistory,
+    FXSettlementStatusHistory, EscrowStatusHistory,
+    ConditionalPaymentStatusHistory, TokenIssuanceStatusHistory,
+)
 from shared.models import AccountType, CurrencyCode, TxnStatus
+from shared.journal import record_journal_pair
 
 
 # ─── Database ─────────────────────────────────────────────────────────────────
+
+COA_SEED_DATA = [
+    ("OMNIBUS_RESERVE", "Omnibus Reserve Account", "asset", "debit"),
+    ("INSTITUTION_LIABILITY", "Institution Token Liability", "liability", "credit"),
+    ("FX_NOSTRO_USD", "FX Nostro USD Account", "asset", "debit"),
+    ("FX_NOSTRO_EUR", "FX Nostro EUR Account", "asset", "debit"),
+    ("FX_NOSTRO_GBP", "FX Nostro GBP Account", "asset", "debit"),
+    ("ESCROW_HOLDING", "Escrow Holding Account", "liability", "credit"),
+    ("SETTLEMENT_PENDING", "Pending Settlement Account", "liability", "credit"),
+    ("FEE_REVENUE", "Fee Revenue Account", "revenue", "credit"),
+]
+
 
 @pytest.fixture(scope="session")
 def engine():
@@ -47,12 +67,23 @@ def engine():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    # SQLite doesn't enforce CHECK constraints by default
     @sa_event.listens_for(eng, "connect")
     def enable_fk(conn, _):
         conn.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(eng)
+
+    session = Session(bind=eng)
+    for code, name, acct_type, normal_bal in COA_SEED_DATA:
+        existing = session.query(ChartOfAccounts).filter_by(code=code).first()
+        if not existing:
+            session.add(ChartOfAccounts(
+                code=code, name=name,
+                account_type=acct_type, normal_balance=normal_bal,
+            ))
+    session.commit()
+    session.close()
+
     return eng
 
 
@@ -112,6 +143,28 @@ def mock_kafka(kafka_spy, monkeypatch):
     yield kafka_spy
 
 
+# ─── Outbox helpers ──────────────────────────────────────────────────────────
+
+def get_outbox_events(db: Session, event_type: str = None) -> list:
+    """Query outbox events, optionally filtered by event_type."""
+    from sqlalchemy import select
+    query = select(OutboxEvent)
+    if event_type:
+        query = query.where(OutboxEvent.event_type == event_type)
+    query = query.order_by(OutboxEvent.created_at)
+    return db.execute(query).scalars().all()
+
+
+def get_status_history(db: Session, model_class, entity_id_field: str, entity_id) -> list:
+    """Query status history rows for a given entity."""
+    from sqlalchemy import select
+    col = getattr(model_class, entity_id_field)
+    entity_uuid = uuid.UUID(str(entity_id)) if not isinstance(entity_id, uuid.UUID) else entity_id
+    return db.execute(
+        select(model_class).where(col == entity_uuid).order_by(model_class.created_at)
+    ).scalars().all()
+
+
 # ─── Account / Balance Factories ─────────────────────────────────────────────
 
 OMNIBUS_ID = "00000000-0000-0000-0000-000000000001"
@@ -147,14 +200,31 @@ def make_balance(
     balance: Decimal,
     reserved: Decimal = Decimal("0"),
 ) -> TokenBalance:
+    """Create a TokenBalance row AND matching journal entries for the balance."""
+    acct_uuid = uuid.UUID(account_id) if isinstance(account_id, str) else account_id
     bal = TokenBalance(
-        account_id=uuid.UUID(account_id) if isinstance(account_id, str) else account_id,
+        account_id=acct_uuid,
         currency=currency,
         balance=balance,
         reserved=reserved,
     )
     db.add(bal)
     db.flush()
+
+    if balance > 0:
+        record_journal_pair(
+            db,
+            account_id=account_id,
+            coa_code="INSTITUTION_LIABILITY",
+            currency=currency,
+            amount=balance,
+            entry_type="initial_balance",
+            reference_id=str(uuid.uuid4()),
+            counter_account_id=OMNIBUS_ID,
+            counter_coa_code="OMNIBUS_RESERVE",
+            narrative="Initial test balance setup",
+        )
+
     return bal
 
 

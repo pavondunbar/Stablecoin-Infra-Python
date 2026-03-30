@@ -19,10 +19,8 @@ PvP (Payment-vs-Payment) is the FX equivalent of DvP in securities — both
 legs settle simultaneously, eliminating Herstatt risk.
 """
 
-import hashlib
 import logging
 import os
-import secrets
 import threading
 import time
 import uuid
@@ -50,12 +48,27 @@ from events import (
     FXRateUpdated, FXSettlementInitiated, FXSettlementLegCompleted,
     FXSettlementCompleted, FXSettlementFailed,
 )
+from shared.journal import (
+    record_journal_pair,
+    get_balance as journal_get_balance,
+    acquire_balance_lock,
+)
+from shared.outbox import insert_outbox_event
+from shared.status import record_status
+from shared.models import (
+    FXSettlementStatusHistory,
+    TransactionStatusHistory,
+    JournalEntry,
+)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 SERVICE     = os.environ.get("SERVICE_NAME", "fx-settlement")
 PRECISION   = Decimal("0.00000001")
 RATE_PREC   = Decimal("0.00000001")
+SIGNING_GATEWAY_URL = os.environ.get(
+    "SIGNING_GATEWAY_URL", "http://signing-gateway:8006"
+)
 
 # Nostro account mapping — in production these are real correspondent bank accounts
 NOSTRO_MAP = {
@@ -97,10 +110,25 @@ def _apply_spread(rate: FXRate, direction: str, custom_bps: Optional[Decimal] = 
         return (rate.mid_rate - half_spread).quantize(RATE_PREC)
 
 
-def _simulate_blockchain_hash(settlement_ref: str) -> str:
-    """Deterministic mock blockchain transaction hash."""
-    payload = f"{settlement_ref}:{secrets.token_hex(16)}"
-    return "0x" + hashlib.sha256(payload.encode()).hexdigest()
+def _sign_settlement(
+    settlement_ref: str, settlement_data: dict
+) -> str:
+    """Call signing gateway for MPC-signed hash."""
+    import httpx
+    try:
+        resp = httpx.post(
+            f"{SIGNING_GATEWAY_URL}/sign",
+            json={
+                "transaction_id": settlement_ref,
+                "payload": settlement_data,
+            },
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("signature", "")
+        return ""
+    except Exception:
+        return ""
 
 
 # ─── PvP Settlement Core ──────────────────────────────────────────────────────
@@ -112,46 +140,34 @@ def _execute_leg(
     currency: str,
     amount: Decimal,
     narrative: str,
+    leg_type: str = "sell",
 ) -> Transaction:
-    """Execute a single FX settlement leg (atomic balance transfer)."""
-    send_bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == debit_id,
-            TokenBalance.currency   == currency,
-        ).with_for_update()
-    ).scalar_one_or_none()
+    """Execute a single FX settlement leg via journal entries.
 
-    if not send_bal or send_bal.available < amount:
+    Args:
+        leg_type: 'sell' or 'buy' — determines COA codes.
+          sell: debit sender INSTITUTION_LIABILITY,
+                credit nostro FX_NOSTRO_{currency}
+          buy:  debit nostro FX_NOSTRO_{currency},
+                credit receiver INSTITUTION_LIABILITY
+    """
+    acquire_balance_lock(db, debit_id, currency)
+
+    available = journal_get_balance(db, debit_id, currency)
+    if available < amount:
         raise ValueError(
             f"Insufficient {currency} balance for {debit_id}: "
-            f"available={getattr(send_bal, 'available', 0)}"
+            f"available={available}"
         )
 
-    recv_bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == credit_id,
-            TokenBalance.currency   == currency,
-        ).with_for_update()
-    ).scalar_one_or_none()
-
-    if not recv_bal:
-        recv_bal = TokenBalance(account_id=credit_id, currency=currency,
-                                balance=Decimal("0"), reserved=Decimal("0"))
-        db.add(recv_bal)
-        db.flush()
-
-    send_bal.balance -= amount
-    send_bal.version += 1
-    recv_bal.balance += amount
-    recv_bal.version += 1
-
     ref = f"FX-{uuid.uuid4().hex[:16].upper()}"
-    db.add(LedgerEntry(txn_ref=ref, entry_type="debit",  account_id=debit_id,
-                       currency=currency, amount=amount, balance_after=send_bal.balance,
-                       narrative=narrative))
-    db.add(LedgerEntry(txn_ref=ref, entry_type="credit", account_id=credit_id,
-                       currency=currency, amount=amount, balance_after=recv_bal.balance,
-                       narrative=narrative))
+
+    if leg_type == "sell":
+        debit_coa = "INSTITUTION_LIABILITY"
+        credit_coa = f"FX_NOSTRO_{currency}"
+    else:
+        debit_coa = f"FX_NOSTRO_{currency}"
+        credit_coa = "INSTITUTION_LIABILITY"
 
     txn = Transaction(
         txn_ref=ref,
@@ -165,35 +181,69 @@ def _execute_leg(
     )
     db.add(txn)
     db.flush()
+
+    record_journal_pair(
+        db,
+        account_id=debit_id,
+        coa_code=debit_coa,
+        currency=currency,
+        amount=amount,
+        entry_type="fx_leg",
+        reference_id=str(txn.id),
+        counter_account_id=credit_id,
+        counter_coa_code=credit_coa,
+        narrative=narrative,
+    )
+
+    record_status(
+        db,
+        TransactionStatusHistory,
+        entity_id_field="transaction_id",
+        entity_id=txn.id,
+        status="COMPLETED",
+    )
+
     return txn
 
 
 def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
-    """
-    Execute a PvP FX settlement atomically:
-      Sell leg: sender pays sell_currency to FX nostro
-      Buy  leg: FX nostro pays buy_currency to receiver
-    Both legs execute in the same DB transaction → atomic PvP.
+    """Execute a PvP FX settlement atomically.
+
+    Sell leg: sender pays sell_currency to FX nostro
+    Buy  leg: FX nostro pays buy_currency to receiver
+    Both legs execute in the same DB transaction.
     """
     fx.status = SettlementStatus.PROCESSING
+    record_status(
+        db, FXSettlementStatusHistory,
+        entity_id_field="settlement_id",
+        entity_id=fx.id, status="PROCESSING",
+    )
     db.flush()
 
     try:
         settle_ref = fx.settlement_ref
 
-        # ── Leg A: sender → nostro (sell currency) ────────────────────────
-        sell_nostro = NOSTRO_MAP.get(fx.sell_currency.value, NOSTRO_MAP["USD"])
+        # -- Leg A: sender -> nostro (sell currency) -----------------------
+        sell_nostro = NOSTRO_MAP.get(
+            fx.sell_currency.value, NOSTRO_MAP["USD"]
+        )
         sell_txn = _execute_leg(
             db,
             debit_id=str(fx.sending_account_id),
             credit_id=sell_nostro,
             currency=fx.sell_currency.value,
             amount=fx.sell_amount,
-            narrative=f"FX sell leg {settle_ref}: sell {fx.sell_currency.value}",
+            narrative=(
+                f"FX sell leg {settle_ref}: "
+                f"sell {fx.sell_currency.value}"
+            ),
+            leg_type="sell",
         )
         fx.sell_txn_id = sell_txn.id
         db.flush()
-        kafka.publish(
+        insert_outbox_event(
+            db, settle_ref,
             "fx.settlement.leg.completed",
             FXSettlementLegCompleted(
                 service=SERVICE,
@@ -205,19 +255,26 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
             ),
         )
 
-        # ── Leg B: nostro → receiver (buy currency) ───────────────────────
-        buy_nostro = NOSTRO_MAP.get(fx.buy_currency.value, NOSTRO_MAP["USD"])
+        # -- Leg B: nostro -> receiver (buy currency) ----------------------
+        buy_nostro = NOSTRO_MAP.get(
+            fx.buy_currency.value, NOSTRO_MAP["USD"]
+        )
         buy_txn = _execute_leg(
             db,
             debit_id=buy_nostro,
             credit_id=str(fx.receiving_account_id),
             currency=fx.buy_currency.value,
             amount=fx.buy_amount,
-            narrative=f"FX buy leg {settle_ref}: buy {fx.buy_currency.value}",
+            narrative=(
+                f"FX buy leg {settle_ref}: "
+                f"buy {fx.buy_currency.value}"
+            ),
+            leg_type="buy",
         )
         fx.buy_txn_id = buy_txn.id
         db.flush()
-        kafka.publish(
+        insert_outbox_event(
+            db, settle_ref,
             "fx.settlement.leg.completed",
             FXSettlementLegCompleted(
                 service=SERVICE,
@@ -229,17 +286,31 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
             ),
         )
 
-        # ── Finalise settlement ───────────────────────────────────────────
+        # -- Finalise settlement -------------------------------------------
         now = datetime.now(timezone.utc)
-        fx.status     = SettlementStatus.SETTLED
+        fx.status = SettlementStatus.SETTLED
         fx.settled_at = now
 
         if fx.rails == SettlementRails.BLOCKCHAIN:
-            fx.blockchain_tx_hash = _simulate_blockchain_hash(settle_ref)
+            fx.blockchain_tx_hash = _sign_settlement(
+                settle_ref,
+                {
+                    "sell_currency": fx.sell_currency.value,
+                    "sell_amount": str(fx.sell_amount),
+                    "buy_currency": fx.buy_currency.value,
+                    "buy_amount": str(fx.buy_amount),
+                },
+            )
 
+        record_status(
+            db, FXSettlementStatusHistory,
+            entity_id_field="settlement_id",
+            entity_id=fx.id, status="SETTLED",
+        )
         db.flush()
 
-        kafka.publish(
+        insert_outbox_event(
+            db, settle_ref,
             "fx.settlement.completed",
             FXSettlementCompleted(
                 service=SERVICE,
@@ -249,10 +320,9 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
                 blockchain_hash=fx.blockchain_tx_hash,
                 settled_at=now,
             ),
-            key=settle_ref,
         )
         log.info(
-            "✅ FX settled: %s  %s %s → %s %s  rate=%s  rails=%s  hash=%s",
+            "FX settled: %s  %s %s -> %s %s  rate=%s  rails=%s  hash=%s",
             settle_ref, fx.sell_amount, fx.sell_currency.value,
             fx.buy_amount, fx.buy_currency.value, fx.applied_rate,
             fx.rails.value, fx.blockchain_tx_hash or "n/a",
@@ -261,12 +331,26 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
 
     except ValueError as exc:
         fx.status = SettlementStatus.FAILED
-        db.flush()
-        kafka.publish(
-            "fx.settlement.failed",
-            FXSettlementFailed(service=SERVICE, settlement_ref=fx.settlement_ref, reason=str(exc)),
+        record_status(
+            db, FXSettlementStatusHistory,
+            entity_id_field="settlement_id",
+            entity_id=fx.id, status="FAILED",
+            detail={"reason": str(exc)},
         )
-        log.error("❌ FX settlement failed: %s reason=%s", fx.settlement_ref, exc)
+        db.flush()
+        insert_outbox_event(
+            db, fx.settlement_ref,
+            "fx.settlement.failed",
+            FXSettlementFailed(
+                service=SERVICE,
+                settlement_ref=fx.settlement_ref,
+                reason=str(exc),
+            ),
+        )
+        log.error(
+            "FX settlement failed: %s reason=%s",
+            fx.settlement_ref, exc,
+        )
         return False
 
 
@@ -525,7 +609,13 @@ def initiate_fx_settlement(
     db.add(fx)
     db.flush()
 
-    kafka.publish(
+    record_status(
+        db, FXSettlementStatusHistory,
+        entity_id_field="settlement_id",
+        entity_id=fx.id, status="QUEUED",
+    )
+    insert_outbox_event(
+        db, ref,
         "fx.settlement.initiated",
         FXSettlementInitiated(
             service=SERVICE,
@@ -539,7 +629,6 @@ def initiate_fx_settlement(
             applied_rate=applied_rate,
             rails=req.rails.value,
         ),
-        key=ref,
     )
 
     return {

@@ -43,6 +43,18 @@ from events import (
     RTGSSettlementSubmitted, RTGSSettlementProcessing,
     RTGSSettlementCompleted, RTGSSettlementFailed, AuditTrailEntry,
 )
+from shared.journal import (
+    record_journal_pair,
+    get_balance as journal_get_balance,
+    acquire_balance_lock,
+)
+from shared.outbox import insert_outbox_event
+from shared.status import record_status
+from shared.models import (
+    RTGSSettlementStatusHistory,
+    TransactionStatusHistory,
+    JournalEntry,
+)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -60,64 +72,41 @@ def _transfer_balances(
     settlement: RTGSSettlement,
 ) -> Transaction:
     """
-    Core atomic transfer.  Uses SELECT FOR UPDATE to prevent concurrent
-    modifications — essential for gross settlement correctness.
+    Core atomic transfer. Acquires advisory lock, checks journal-derived
+    balance, then records a debit/credit journal pair.
     """
-    send_bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == str(settlement.sending_account_id),
-            TokenBalance.currency   == settlement.currency,
-        ).with_for_update()
-    ).scalar_one_or_none()
+    sender_id = str(settlement.sending_account_id)
+    receiver_id = str(settlement.receiving_account_id)
+    currency = settlement.currency.value
+    ref = settlement.settlement_ref
+    narrative = f"RTGS settlement {ref}"
 
-    if send_bal is None or send_bal.available < settlement.amount:
+    acquire_balance_lock(db, sender_id, currency)
+
+    available = journal_get_balance(db, sender_id, currency)
+    if available < settlement.amount:
         raise ValueError(
-            f"Insufficient balance: available={getattr(send_bal, 'available', 0)} "
+            f"Insufficient balance: available={available} "
             f"required={settlement.amount}"
         )
 
-    recv_bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == str(settlement.receiving_account_id),
-            TokenBalance.currency   == settlement.currency,
-        ).with_for_update()
-    ).scalar_one_or_none()
-
-    if recv_bal is None:
-        recv_bal = TokenBalance(
-            account_id=str(settlement.receiving_account_id),
-            currency=settlement.currency,
-            balance=Decimal("0"),
-            reserved=Decimal("0"),
-        )
-        db.add(recv_bal)
-        db.flush()
-
-    send_bal.balance -= settlement.amount
-    send_bal.version += 1
-    recv_bal.balance += settlement.amount
-    recv_bal.version += 1
-
-    ref = settlement.settlement_ref
-    db.add(LedgerEntry(
-        txn_ref=ref, entry_type="debit",
-        account_id=str(settlement.sending_account_id),
-        currency=settlement.currency, amount=settlement.amount,
-        balance_after=send_bal.balance,
-        narrative=f"RTGS settlement {ref}",
-    ))
-    db.add(LedgerEntry(
-        txn_ref=ref, entry_type="credit",
-        account_id=str(settlement.receiving_account_id),
-        currency=settlement.currency, amount=settlement.amount,
-        balance_after=recv_bal.balance,
-        narrative=f"RTGS settlement {ref}",
-    ))
+    record_journal_pair(
+        db,
+        sender_id,
+        "INSTITUTION_LIABILITY",
+        currency,
+        settlement.amount,
+        "rtgs_settlement",
+        str(settlement.id),
+        receiver_id,
+        "INSTITUTION_LIABILITY",
+        narrative,
+    )
 
     txn = Transaction(
         txn_ref=ref,
-        debit_account_id=str(settlement.sending_account_id),
-        credit_account_id=str(settlement.receiving_account_id),
+        debit_account_id=sender_id,
+        credit_account_id=receiver_id,
         currency=settlement.currency,
         amount=settlement.amount,
         txn_type="rtgs_settlement",
@@ -132,25 +121,41 @@ def _transfer_balances(
 
 def _process_one_settlement(db: Session, settlement: RTGSSettlement) -> bool:
     """Process a single settlement; returns True on success."""
-    settlement.status           = SettlementStatus.PROCESSING
+    settlement.status = SettlementStatus.PROCESSING
     settlement.processing_started = datetime.now(timezone.utc)
+    record_status(
+        db, RTGSSettlementStatusHistory,
+        "settlement_id", settlement.id,
+        SettlementStatus.PROCESSING.value,
+    )
     db.flush()
 
-    kafka.publish(
+    insert_outbox_event(
+        db,
+        settlement.settlement_ref,
         "rtgs.settlement.processing",
-        RTGSSettlementProcessing(service=SERVICE,
-                                 settlement_ref=settlement.settlement_ref,
-                                 started_at=settlement.processing_started),
+        RTGSSettlementProcessing(
+            service=SERVICE,
+            settlement_ref=settlement.settlement_ref,
+            started_at=settlement.processing_started,
+        ),
     )
 
     try:
         txn = _transfer_balances(db, settlement)
-        settlement.status         = SettlementStatus.SETTLED
-        settlement.settled_at     = datetime.now(timezone.utc)
+        settlement.status = SettlementStatus.SETTLED
+        settlement.settled_at = datetime.now(timezone.utc)
         settlement.transaction_id = txn.id
+        record_status(
+            db, RTGSSettlementStatusHistory,
+            "settlement_id", settlement.id,
+            SettlementStatus.SETTLED.value,
+        )
         db.flush()
 
-        kafka.publish(
+        insert_outbox_event(
+            db,
+            settlement.settlement_ref,
             "rtgs.settlement.completed",
             RTGSSettlementCompleted(
                 service=SERVICE,
@@ -162,30 +167,48 @@ def _process_one_settlement(db: Session, settlement: RTGSSettlement) -> bool:
                 transaction_id=str(txn.id),
                 settled_at=settlement.settled_at,
             ),
-            key=settlement.settlement_ref,
         )
-        log.info("✅ Settled: %s  amount=%s %s",
-                 settlement.settlement_ref, settlement.amount, settlement.currency)
+        log.info("Settled: %s  amount=%s %s",
+                 settlement.settlement_ref, settlement.amount,
+                 settlement.currency)
         return True
 
     except ValueError as exc:
-        settlement.status        = SettlementStatus.FAILED
-        settlement.failure_reason = str(exc)
-        settlement.retry_count   += 1
+        settlement.retry_count += 1
 
-        # Retry up to MAX_RETRY for transient failures
         if settlement.retry_count < MAX_RETRY and "Insufficient" not in str(exc):
             settlement.status = SettlementStatus.QUEUED
-            log.warning("Retry %d/%d for %s", settlement.retry_count, MAX_RETRY, settlement.settlement_ref)
-        else:
-            kafka.publish(
-                "rtgs.settlement.failed",
-                RTGSSettlementFailed(service=SERVICE,
-                                     settlement_ref=settlement.settlement_ref,
-                                     reason=str(exc),
-                                     retry_count=settlement.retry_count),
+            record_status(
+                db, RTGSSettlementStatusHistory,
+                "settlement_id", settlement.id,
+                SettlementStatus.QUEUED.value,
+                detail={"reason": str(exc), "retry": settlement.retry_count},
             )
-            log.error("❌ Failed: %s reason=%s", settlement.settlement_ref, exc)
+            log.warning("Retry %d/%d for %s",
+                        settlement.retry_count, MAX_RETRY,
+                        settlement.settlement_ref)
+        else:
+            settlement.status = SettlementStatus.FAILED
+            record_status(
+                db, RTGSSettlementStatusHistory,
+                "settlement_id", settlement.id,
+                SettlementStatus.FAILED.value,
+                detail={"reason": str(exc),
+                        "retry_count": settlement.retry_count},
+            )
+            insert_outbox_event(
+                db,
+                settlement.settlement_ref,
+                "rtgs.settlement.failed",
+                RTGSSettlementFailed(
+                    service=SERVICE,
+                    settlement_ref=settlement.settlement_ref,
+                    reason=str(exc),
+                    retry_count=settlement.retry_count,
+                ),
+            )
+            log.error("Failed: %s reason=%s",
+                      settlement.settlement_ref, exc)
         db.flush()
         return False
 
@@ -333,7 +356,9 @@ def submit_settlement(req: SubmitSettlementRequest, db: Session = Depends(get_db
     db.add(settlement)
     db.flush()
 
-    kafka.publish(
+    insert_outbox_event(
+        db,
+        ref,
         "rtgs.settlement.submitted",
         RTGSSettlementSubmitted(
             service=SERVICE,
@@ -344,7 +369,6 @@ def submit_settlement(req: SubmitSettlementRequest, db: Session = Depends(get_db
             amount=amount,
             priority=req.priority,
         ),
-        key=ref,
     )
 
     return SettlementResponse(

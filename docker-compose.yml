@@ -13,6 +13,9 @@ networks:
   internal:
     driver: bridge
     internal: true          # no outbound internet access from internal net
+  signing:
+    driver: bridge
+    internal: true
 
 volumes:
   postgres_data:
@@ -175,18 +178,121 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+      signing-gateway:
+        condition: service_healthy
     environment:
       SERVICE_NAME: fx-settlement
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-stablecoin}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-stablecoin_db}
       KAFKA_BOOTSTRAP: kafka:9092
+      SIGNING_GATEWAY_URL: http://signing-gateway:8006
       PORT: 8004
     networks:
       - internal
+      - signing
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
       interval: 15s
       timeout: 5s
       retries: 5
+
+  # ── Outbox Publisher ──────────────────────────────────────────────────────
+
+  outbox-publisher:
+    build:
+      context: .
+      dockerfile: services/outbox-publisher/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://stablecoin:stablecoin_pass@postgres:5432/stablecoin_db
+      KAFKA_BOOTSTRAP: kafka:9092
+      POLL_INTERVAL_MS: 100
+      SERVICE_NAME: outbox-publisher
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Signing Infrastructure ──────────────────────────────────────────────
+
+  signing-gateway:
+    build:
+      context: .
+      dockerfile: services/signing-gateway/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mpc-node-1:
+        condition: service_healthy
+      mpc-node-2:
+        condition: service_healthy
+      mpc-node-3:
+        condition: service_healthy
+    environment:
+      MPC_NODES: http://mpc-node-1:8001,http://mpc-node-2:8001,http://mpc-node-3:8001
+      SERVICE_NAME: signing-gateway
+    networks:
+      - internal
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mpc-node-1:
+    build:
+      context: .
+      dockerfile: services/mpc-node/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ID: node-1
+      SERVICE_NAME: mpc-node-1
+    networks:
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mpc-node-2:
+    build:
+      context: .
+      dockerfile: services/mpc-node/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ID: node-2
+      SERVICE_NAME: mpc-node-2
+    networks:
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mpc-node-3:
+    build:
+      context: .
+      dockerfile: services/mpc-node/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ID: node-3
+      SERVICE_NAME: mpc-node-3
+    networks:
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # ── Compliance Monitor ────────────────────────────────────────────────────
 

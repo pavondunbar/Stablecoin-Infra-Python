@@ -1,21 +1,20 @@
 """
 services/token-issuance/main.py
-────────────────────────────────
+--------------------------------
 Tokenized Deposit Issuance & Redemption Engine
 
 Responsibilities:
-  • Issue tokenized deposits against a verified fiat backing reference
-  • Redeem tokens back to fiat (triggers reverse settlement)
-  • Maintain atomic double-entry ledger for every operation
-  • Publish issuance/redemption/balance events to Kafka
-  • Run a background consumer for settlement-triggered redemptions
+  - Issue tokenized deposits against a verified fiat backing reference
+  - Redeem tokens back to fiat (triggers reverse settlement)
+  - Record immutable double-entry journal pairs for every operation
+  - Write events to the transactional outbox for reliable publishing
+  - Track status transitions via append-only status history
 
 Trust boundary: only reachable from the internal Docker network.
 """
 
 import logging
 import os
-import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -24,92 +23,64 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-# ── path setup so we can import the shared package ────────────────────────────
+# ── path setup so we can import the shared package ──────────────────
 import sys
 sys.path.insert(0, "/app/shared")
 
 from database import get_db_session
 from metrics import instrument_app, record_business_event
 from models import (
-    Account, LedgerEntry, TokenBalance, TokenIssuance, Transaction,
+    Account, TokenIssuance, Transaction,
     CurrencyCode, TxnStatus,
 )
-import kafka_client as kafka
+from shared.journal import (
+    record_journal_pair,
+    get_balance as journal_get_balance,
+    get_available_balance,
+    acquire_balance_lock,
+)
+from shared.outbox import insert_outbox_event
+from shared.status import record_status
+from shared.models import (
+    TokenIssuanceStatusHistory,
+    TransactionStatusHistory,
+    JournalEntry,
+)
 from events import (
     TokenIssuanceCompleted, TokenIssuanceRequested,
     TokenRedemptionCompleted, TokenRedemptionRequested,
     TokenBalanceUpdated, AuditTrailEntry,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 SERVICE = os.environ.get("SERVICE_NAME", "token-issuance")
 OMNIBUS_ACCOUNT_ID = "00000000-0000-0000-0000-000000000001"
 
-PRECISION = Decimal("0.00000001")   # 8 decimal places
+PRECISION = Decimal("0.000000000000000001")  # 18 decimal places
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── Helpers ────────────────────────────────────────────────────────
 
 def normalize(amount: Decimal) -> Decimal:
     return amount.quantize(PRECISION, rounding=ROUND_HALF_EVEN)
 
 
-def _get_or_create_balance(
-    db: Session, account_id: str, currency: str
-) -> TokenBalance:
-    bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == account_id,
-            TokenBalance.currency == currency,
-        ).with_for_update()   # row-level lock during mutation
-    ).scalar_one_or_none()
-
-    if bal is None:
-        bal = TokenBalance(
-            account_id=account_id,
-            currency=currency,
-            balance=Decimal("0"),
-            reserved=Decimal("0"),
-        )
-        db.add(bal)
-        db.flush()
-    return bal
-
-
-def _record_ledger(
-    db: Session,
-    txn_ref: str,
-    entry_type: str,
-    account_id: str,
-    currency: str,
-    amount: Decimal,
-    balance_after: Decimal,
-    narrative: str,
-) -> None:
-    db.add(LedgerEntry(
-        txn_ref=txn_ref,
-        entry_type=entry_type,
-        account_id=account_id,
-        currency=currency,
-        amount=amount,
-        balance_after=balance_after,
-        narrative=narrative,
-    ))
-
-
-# ─── API Schemas ──────────────────────────────────────────────────────────────
+# ─── API Schemas ────────────────────────────────────────────────────
 
 class IssueTokensRequest(BaseModel):
     account_id:    str
     currency:      CurrencyCode
     amount:        Decimal = Field(gt=0)
-    backing_ref:   str                          # reference to underlying fiat deposit
+    backing_ref:   str
     custodian:     Optional[str] = None
     idempotency_key: Optional[str] = None
 
@@ -139,7 +110,7 @@ class IssuanceResponse(BaseModel):
     status:       str
 
 
-# ─── Business Logic ───────────────────────────────────────────────────────────
+# ─── Business Logic ─────────────────────────────────────────────────
 
 def _issue_tokens(
     db: Session,
@@ -155,7 +126,9 @@ def _issue_tokens(
     # Idempotency guard
     if idempotency_key:
         existing = db.execute(
-            select(TokenIssuance).where(TokenIssuance.issuance_ref == idempotency_key)
+            select(TokenIssuance).where(
+                TokenIssuance.issuance_ref == idempotency_key
+            )
         ).scalar_one_or_none()
         if existing:
             return existing
@@ -163,13 +136,35 @@ def _issue_tokens(
     # Verify account exists and is KYC/AML cleared
     account = db.get(Account, account_id)
     if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
+        raise HTTPException(
+            status_code=404, detail="Account not found"
+        )
     if not account.kyc_verified or not account.aml_cleared:
-        raise HTTPException(status_code=403, detail="Account not KYC/AML cleared")
+        raise HTTPException(
+            status_code=403, detail="Account not KYC/AML cleared"
+        )
     if not account.is_active:
-        raise HTTPException(status_code=403, detail="Account is not active")
+        raise HTTPException(
+            status_code=403, detail="Account is not active"
+        )
 
-    issuance_ref = idempotency_key or f"ISS-{uuid.uuid4().hex[:16].upper()}"
+    issuance_ref = (
+        idempotency_key
+        or f"ISS-{uuid.uuid4().hex[:16].upper()}"
+    )
+
+    # Acquire advisory lock on omnibus account
+    acquire_balance_lock(db, OMNIBUS_ACCOUNT_ID, currency)
+
+    # Check omnibus reserve balance via journal
+    omnibus_balance = journal_get_balance(
+        db, OMNIBUS_ACCOUNT_ID, currency
+    )
+    if omnibus_balance < amount:
+        raise HTTPException(
+            status_code=422,
+            detail="Insufficient reserve balance",
+        )
 
     # Create issuance record
     issuance = TokenIssuance(
@@ -185,22 +180,21 @@ def _issue_tokens(
     db.add(issuance)
     db.flush()
 
-    # Debit omnibus reserve
-    omnibus_bal = _get_or_create_balance(db, OMNIBUS_ACCOUNT_ID, currency)
-    if omnibus_bal.balance < amount:
-        raise HTTPException(status_code=422, detail="Insufficient reserve balance")
-    omnibus_bal.balance  -= amount
-    omnibus_bal.version  += 1
-    _record_ledger(db, issuance_ref, "debit", OMNIBUS_ACCOUNT_ID, currency, amount,
-                   omnibus_bal.balance, f"Token issuance to {account_id}")
-
-    # Credit recipient account
-    recv_bal = _get_or_create_balance(db, account_id, currency)
-    old_balance = recv_bal.balance
-    recv_bal.balance  += amount
-    recv_bal.version  += 1
-    _record_ledger(db, issuance_ref, "credit", account_id, currency, amount,
-                   recv_bal.balance, f"Token issuance ref={backing_ref}")
+    # Record journal pair: debit OMNIBUS_RESERVE, credit
+    # INSTITUTION_LIABILITY
+    narrative = f"Token issuance to {account_id}"
+    record_journal_pair(
+        db,
+        OMNIBUS_ACCOUNT_ID,
+        "OMNIBUS_RESERVE",
+        currency,
+        amount,
+        "token_issuance",
+        issuance_ref,
+        str(account.id),
+        "INSTITUTION_LIABILITY",
+        narrative,
+    )
 
     # Create transaction record
     txn = Transaction(
@@ -215,13 +209,37 @@ def _issue_tokens(
         settled_at=datetime.now(timezone.utc),
     )
     db.add(txn)
-
-    issuance.status    = TxnStatus.COMPLETED
-    issuance.issued_at = datetime.now(timezone.utc)
     db.flush()
 
-    # Publish events (after flush, before commit)
-    kafka.publish(
+    # Record status history
+    record_status(
+        db,
+        TransactionStatusHistory,
+        "transaction_id",
+        txn.id,
+        "completed",
+    )
+
+    # Mark issuance completed (keep direct assignment for
+    # SQLite test compat; DB trigger handles it in prod)
+    issuance.status = TxnStatus.COMPLETED
+    issuance.issued_at = datetime.now(timezone.utc)
+    record_status(
+        db,
+        TokenIssuanceStatusHistory,
+        "issuance_id",
+        issuance.id,
+        "completed",
+    )
+    db.flush()
+
+    # Derive new balance from journal
+    new_balance = journal_get_balance(db, account_id, currency)
+
+    # Write events to transactional outbox
+    insert_outbox_event(
+        db,
+        issuance_ref,
         "token.issuance.completed",
         TokenIssuanceCompleted(
             service=SERVICE,
@@ -229,22 +247,22 @@ def _issue_tokens(
             account_id=account_id,
             currency=currency,
             amount=amount,
-            new_balance=recv_bal.balance,
+            new_balance=new_balance,
         ),
-        key=account_id,
     )
-    kafka.publish(
+    insert_outbox_event(
+        db,
+        issuance_ref,
         "token.balance.updated",
         TokenBalanceUpdated(
             service=SERVICE,
             account_id=account_id,
             currency=currency,
-            old_balance=old_balance,
-            new_balance=recv_bal.balance,
-            reserved=recv_bal.reserved,
+            old_balance=new_balance - amount,
+            new_balance=new_balance,
+            reserved=Decimal("0"),
             reason="issuance",
         ),
-        key=account_id,
     )
 
     return issuance
@@ -262,24 +280,41 @@ def _redeem_tokens(
 
     if idempotency_key:
         existing = db.execute(
-            select(TokenIssuance).where(TokenIssuance.issuance_ref == idempotency_key)
+            select(TokenIssuance).where(
+                TokenIssuance.issuance_ref == idempotency_key
+            )
         ).scalar_one_or_none()
         if existing:
             return existing
 
     account = db.get(Account, account_id)
     if not account or not account.is_active:
-        raise HTTPException(status_code=404, detail="Account not found or inactive")
-
-    # Debit the account
-    acct_bal = _get_or_create_balance(db, account_id, currency)
-    if acct_bal.available < amount:
         raise HTTPException(
-            status_code=422,
-            detail=f"Insufficient available balance: {acct_bal.available} {currency}"
+            status_code=404,
+            detail="Account not found or inactive",
         )
 
-    redemption_ref = idempotency_key or f"RED-{uuid.uuid4().hex[:16].upper()}"
+    # Acquire advisory lock on the account
+    acquire_balance_lock(db, account_id, currency)
+
+    # Check available balance via journal
+    available = get_available_balance(db, account_id, currency)
+    if available < amount:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Insufficient available balance:"
+                f" {available} {currency}"
+            ),
+        )
+
+    redemption_ref = (
+        idempotency_key
+        or f"RED-{uuid.uuid4().hex[:16].upper()}"
+    )
+
+    # Capture old balance before journal entry
+    old_balance = journal_get_balance(db, account_id, currency)
 
     issuance = TokenIssuance(
         issuance_ref=redemption_ref,
@@ -293,18 +328,21 @@ def _redeem_tokens(
     db.add(issuance)
     db.flush()
 
-    old_balance = acct_bal.balance
-    acct_bal.balance  -= amount
-    acct_bal.version  += 1
-    _record_ledger(db, redemption_ref, "debit", account_id, currency, amount,
-                   acct_bal.balance, f"Token redemption ref={settlement_ref}")
-
-    # Credit omnibus reserve
-    omnibus_bal = _get_or_create_balance(db, OMNIBUS_ACCOUNT_ID, currency)
-    omnibus_bal.balance  += amount
-    omnibus_bal.version  += 1
-    _record_ledger(db, redemption_ref, "credit", OMNIBUS_ACCOUNT_ID, currency, amount,
-                   omnibus_bal.balance, f"Token redemption from {account_id}")
+    # Record journal pair: debit INSTITUTION_LIABILITY, credit
+    # OMNIBUS_RESERVE
+    narrative = f"Token redemption ref={settlement_ref}"
+    record_journal_pair(
+        db,
+        str(account.id),
+        "INSTITUTION_LIABILITY",
+        currency,
+        amount,
+        "token_redemption",
+        redemption_ref,
+        OMNIBUS_ACCOUNT_ID,
+        "OMNIBUS_RESERVE",
+        narrative,
+    )
 
     txn = Transaction(
         txn_ref=redemption_ref,
@@ -318,12 +356,36 @@ def _redeem_tokens(
         settled_at=datetime.now(timezone.utc),
     )
     db.add(txn)
-
-    issuance.status      = TxnStatus.COMPLETED
-    issuance.redeemed_at = datetime.now(timezone.utc)
     db.flush()
 
-    kafka.publish(
+    # Record status history
+    record_status(
+        db,
+        TransactionStatusHistory,
+        "transaction_id",
+        txn.id,
+        "completed",
+    )
+
+    # Mark redemption completed
+    issuance.status = TxnStatus.COMPLETED
+    issuance.redeemed_at = datetime.now(timezone.utc)
+    record_status(
+        db,
+        TokenIssuanceStatusHistory,
+        "issuance_id",
+        issuance.id,
+        "completed",
+    )
+    db.flush()
+
+    # Derive new balance from journal
+    new_balance = journal_get_balance(db, account_id, currency)
+
+    # Write events to transactional outbox
+    insert_outbox_event(
+        db,
+        redemption_ref,
         "token.redemption.completed",
         TokenRedemptionCompleted(
             service=SERVICE,
@@ -331,32 +393,32 @@ def _redeem_tokens(
             account_id=account_id,
             currency=currency,
             amount=amount,
-            new_balance=acct_bal.balance,
+            new_balance=new_balance,
         ),
-        key=account_id,
     )
-    kafka.publish(
+    insert_outbox_event(
+        db,
+        redemption_ref,
         "token.balance.updated",
         TokenBalanceUpdated(
             service=SERVICE,
             account_id=account_id,
             currency=currency,
             old_balance=old_balance,
-            new_balance=acct_bal.balance,
-            reserved=acct_bal.reserved,
+            new_balance=new_balance,
+            reserved=Decimal("0"),
             reason="redemption",
         ),
-        key=account_id,
     )
 
     return issuance
 
 
-# ─── FastAPI App ──────────────────────────────────────────────────────────────
+# ─── FastAPI App ────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Token Issuance Service starting up…")
+    log.info("Token Issuance Service starting up...")
     yield
     log.info("Token Issuance Service shutting down.")
 
@@ -364,7 +426,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Token Issuance Service",
     version="1.0.0",
-    description="Issues and redeems tokenized bank deposits (JPM Coin / PYUSD style)",
+    description=(
+        "Issues and redeems tokenized bank deposits"
+        " (JPM Coin / PYUSD style)"
+    ),
     lifespan=lifespan,
 )
 instrument_app(app, SERVICE)
@@ -375,12 +440,21 @@ def health():
     return {"status": "ok", "service": SERVICE}
 
 
-@app.post("/tokens/issue", response_model=IssuanceResponse, status_code=status.HTTP_201_CREATED)
-def issue_tokens(req: IssueTokensRequest, db: Session = Depends(get_db_session)):
-    """
-    Issue tokenized deposits to an institutional account.
-    The `backing_ref` must correspond to a verified fiat deposit held by a custodian.
-    Atomic double-entry: omnibus reserve is debited, recipient is credited.
+@app.post(
+    "/tokens/issue",
+    response_model=IssuanceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def issue_tokens(
+    req: IssueTokensRequest,
+    db: Session = Depends(get_db_session),
+):
+    """Issue tokenized deposits to an institutional account.
+
+    The `backing_ref` must correspond to a verified fiat deposit
+    held by a custodian.
+    Atomic double-entry: omnibus reserve is debited, recipient
+    is credited.
     """
     issuance = _issue_tokens(
         db,
@@ -392,28 +466,33 @@ def issue_tokens(req: IssueTokensRequest, db: Session = Depends(get_db_session))
         idempotency_key=req.idempotency_key,
     )
 
-    bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == req.account_id,
-            TokenBalance.currency   == req.currency,
-        )
-    ).scalar_one()
+    new_balance = journal_get_balance(
+        db, str(req.account_id), req.currency.value
+    )
 
     return IssuanceResponse(
         issuance_ref=issuance.issuance_ref,
         account_id=str(req.account_id),
         currency=req.currency.value,
         amount=issuance.amount,
-        new_balance=bal.balance,
+        new_balance=new_balance,
         status=issuance.status.value,
     )
 
 
-@app.post("/tokens/redeem", response_model=IssuanceResponse, status_code=status.HTTP_201_CREATED)
-def redeem_tokens(req: RedeemTokensRequest, db: Session = Depends(get_db_session)):
-    """
-    Redeem tokenized deposits back to fiat.
-    Atomically burns tokens and credits the omnibus reserve for fiat payout.
+@app.post(
+    "/tokens/redeem",
+    response_model=IssuanceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def redeem_tokens(
+    req: RedeemTokensRequest,
+    db: Session = Depends(get_db_session),
+):
+    """Redeem tokenized deposits back to fiat.
+
+    Atomically burns tokens and credits the omnibus reserve for
+    fiat payout.
     """
     issuance = _redeem_tokens(
         db,
@@ -424,44 +503,60 @@ def redeem_tokens(req: RedeemTokensRequest, db: Session = Depends(get_db_session
         idempotency_key=req.idempotency_key,
     )
 
-    bal = db.execute(
-        select(TokenBalance).where(
-            TokenBalance.account_id == req.account_id,
-            TokenBalance.currency   == req.currency,
-        )
-    ).scalar_one()
+    new_balance = journal_get_balance(
+        db, str(req.account_id), req.currency.value
+    )
 
     return IssuanceResponse(
         issuance_ref=issuance.issuance_ref,
         account_id=str(req.account_id),
         currency=req.currency.value,
         amount=issuance.amount,
-        new_balance=bal.balance,
+        new_balance=new_balance,
         status=issuance.status.value,
     )
 
 
-@app.get("/tokens/balance/{account_id}", response_model=list[TokenBalanceResponse])
-def get_balances(account_id: str, db: Session = Depends(get_db_session)):
+@app.get(
+    "/tokens/balance/{account_id}",
+    response_model=list[TokenBalanceResponse],
+)
+def get_balances(
+    account_id: str,
+    db: Session = Depends(get_db_session),
+):
     """Return all tokenized deposit balances for an account."""
     account = db.get(Account, account_id)
     if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
+        raise HTTPException(
+            status_code=404, detail="Account not found"
+        )
 
-    balances = db.execute(
-        select(TokenBalance).where(TokenBalance.account_id == account_id)
+    # Get distinct currencies from journal entries for this account
+    acct_uuid = uuid.UUID(account_id)
+    currencies = db.execute(
+        select(JournalEntry.currency).where(
+            JournalEntry.account_id == acct_uuid,
+            JournalEntry.coa_code == "INSTITUTION_LIABILITY",
+        ).distinct()
     ).scalars().all()
 
-    return [
-        TokenBalanceResponse(
-            account_id=account_id,
-            currency=b.currency.value,
-            balance=b.balance,
-            reserved=b.reserved,
-            available=b.available,
+    results = []
+    for curr in currencies:
+        balance = journal_get_balance(db, account_id, curr)
+        available = get_available_balance(db, account_id, curr)
+        reserved = balance - available
+        results.append(
+            TokenBalanceResponse(
+                account_id=account_id,
+                currency=curr,
+                balance=balance,
+                reserved=reserved,
+                available=available,
+            )
         )
-        for b in balances
-    ]
+
+    return results
 
 
 @app.post("/accounts", status_code=status.HTTP_201_CREATED)
@@ -487,4 +582,6 @@ def create_account(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8001))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(
+        "main:app", host="0.0.0.0", port=port, log_level="info"
+    )

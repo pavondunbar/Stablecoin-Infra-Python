@@ -47,10 +47,11 @@ SERVICE           = os.environ.get("SERVICE_NAME", "api-gateway")
 GATEWAY_API_KEY   = os.environ["GATEWAY_API_KEY"]
 
 UPSTREAM = {
-    "token":   os.environ.get("TOKEN_ISSUANCE_URL", "http://token-issuance:8001"),
+    "token":   os.environ.get("TOKEN_ISSUANCE_URL",  "http://token-issuance:8001"),
     "rtgs":    os.environ.get("RTGS_URL",            "http://rtgs:8002"),
     "payment": os.environ.get("PAYMENT_ENGINE_URL",  "http://payment-engine:8003"),
     "fx":      os.environ.get("FX_SETTLEMENT_URL",   "http://fx-settlement:8004"),
+    "signing": os.environ.get("SIGNING_GATEWAY_URL", "http://signing-gateway:8006"),
 }
 
 # ─── Rate Limiter (in-memory, per API key) ────────────────────────────────────
