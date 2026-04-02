@@ -10,13 +10,13 @@ import sys
 import uuid
 from decimal import Decimal
 from typing import Generator
-from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event as sa_event
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.types import JSON
+from sqlalchemy.dialects.postgresql import JSONB
 
 # ── path setup ────────────────────────────────────────────────────────────────
 sys.path.insert(0, "/home/claude/stablecoin-infra")
@@ -37,12 +37,9 @@ os.environ.setdefault("SIGNING_GATEWAY_URL", "http://signing-gateway:8006")
 
 from shared.models import (
     Base, Account, TokenBalance, FXRate, ChartOfAccounts,
-    JournalEntry, OutboxEvent, EscrowHold,
-    TransactionStatusHistory, RTGSSettlementStatusHistory,
-    FXSettlementStatusHistory, EscrowStatusHistory,
-    ConditionalPaymentStatusHistory, TokenIssuanceStatusHistory,
+    OutboxEvent, ApiKey,
 )
-from shared.models import AccountType, CurrencyCode, TxnStatus
+from shared.rbac import hash_api_key
 from shared.journal import record_journal_pair
 
 
@@ -70,6 +67,12 @@ def engine():
     @sa_event.listens_for(eng, "connect")
     def enable_fk(conn, _):
         conn.execute("PRAGMA foreign_keys=ON")
+
+    # SQLite can't render JSONB — remap to plain JSON (stored as TEXT)
+    for table in Base.metadata.tables.values():
+        for col in table.columns:
+            if isinstance(col.type, JSONB):
+                col.type = JSON()
 
     Base.metadata.create_all(eng)
 
@@ -279,3 +282,24 @@ def bob(db, omnibus) -> Account:
 @pytest.fixture
 def unverified_account(db) -> Account:
     return make_account(db, "Unverified Corp", kyc=False, aml=False)
+
+
+def make_api_key(
+    db: Session,
+    raw_key: str = "test-key-123",
+    actor_name: str = "Test Actor",
+    role: str = "admin",
+    is_active: bool = True,
+    actor_id: str = None,
+) -> ApiKey:
+    """Create an API key for testing."""
+    key = ApiKey(
+        key_hash=hash_api_key(raw_key),
+        actor_id=uuid.UUID(actor_id) if actor_id else uuid.uuid4(),
+        actor_name=actor_name,
+        role=role,
+        is_active=is_active,
+    )
+    db.add(key)
+    db.flush()
+    return key

@@ -12,7 +12,8 @@ import json
 import logging
 import os
 import time
-from typing import Any, Callable, Optional, Type, TypeVar
+from datetime import datetime, timezone
+from typing import Callable, Optional, TypeVar
 
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 from pydantic import BaseModel
@@ -104,15 +105,50 @@ def build_consumer(group_id: str, topics: list[str]) -> Consumer:
     return consumer
 
 
+_retry_tracker: dict[str, int] = {}
+
+
+def _send_to_dlq(
+    dlq_topic: str,
+    original_topic: str,
+    partition: int,
+    offset: int,
+    payload: bytes,
+    error: str,
+    retry_count: int,
+) -> None:
+    """Publish a failed message to the dead-letter queue topic."""
+    dlq_payload = {
+        "original_topic": original_topic,
+        "original_partition": partition,
+        "original_offset": offset,
+        "payload": payload.decode("utf-8", errors="replace"),
+        "error": str(error),
+        "retry_count": retry_count,
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "service": SERVICE_NAME,
+    }
+    publish_dict(dlq_topic, dlq_payload)
+    log.warning(
+        "Sent to DLQ | topic=%s partition=%d offset=%d",
+        original_topic, partition, offset,
+    )
+
+
 def consume_loop(
     consumer: Consumer,
     handler: Callable[[str, dict], None],
     poll_timeout: float = 1.0,
     max_errors: int = 10,
+    max_handler_retries: int = 3,
+    dlq_topic: str = "dlq.default",
 ) -> None:
-    """
-    Blocking consume loop.  Calls handler(topic, payload_dict) for each message.
-    Commits offset only after successful handler execution.
+    """Blocking consume loop with DLQ routing.
+
+    Calls handler(topic, payload_dict) for each message. Commits
+    offset only after successful handler execution. On handler
+    failure, retries up to max_handler_retries with exponential
+    backoff, then routes to the DLQ topic.
     """
     consecutive_errors = 0
     try:
@@ -131,15 +167,60 @@ def consume_loop(
                 continue
 
             consecutive_errors = 0
-            topic   = msg.topic()
-            raw     = msg.value()
+            topic = msg.topic()
+            raw = msg.value()
+            tracker_key = (
+                f"{topic}:{msg.partition()}:{msg.offset()}"
+            )
             try:
                 payload = json.loads(raw)
                 handler(topic, payload)
                 consumer.commit(message=msg, asynchronous=False)
+                _retry_tracker.pop(tracker_key, None)
             except Exception as exc:
-                log.exception("Handler error | topic=%s exc=%s", topic, exc)
-                # In production: send to DLQ topic
+                count = _retry_tracker.get(tracker_key, 0) + 1
+                _retry_tracker[tracker_key] = count
+                log.exception(
+                    "Handler error | topic=%s attempt=%d exc=%s",
+                    topic, count, exc,
+                )
+                if count >= max_handler_retries:
+                    _send_to_dlq(
+                        dlq_topic, topic,
+                        msg.partition(), msg.offset(),
+                        raw, str(exc), count,
+                    )
+                    consumer.commit(
+                        message=msg, asynchronous=False
+                    )
+                    _retry_tracker.pop(tracker_key, None)
+                else:
+                    backoff = min(2 ** count, 30)
+                    time.sleep(backoff)
     finally:
         consumer.close()
         log.info("Consumer closed.")
+
+
+# ─── Deduplication Helpers ───────────────────────────────────────────────────
+
+def is_duplicate_event(db, event_id: str) -> bool:
+    """Check if an event has already been processed."""
+    from shared.models import ProcessedEvent
+    from sqlalchemy import select
+
+    return db.execute(
+        select(ProcessedEvent).where(
+            ProcessedEvent.event_id == event_id
+        )
+    ).scalar_one_or_none() is not None
+
+
+def mark_event_processed(
+    db, event_id: str, topic: str
+) -> None:
+    """Record that an event has been processed."""
+    from shared.models import ProcessedEvent
+
+    db.add(ProcessedEvent(event_id=event_id, topic=topic))
+    db.flush()

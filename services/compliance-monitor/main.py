@@ -238,6 +238,21 @@ def _run_screening(
 
 def handle_event(topic: str, payload: dict):
     """Route each Kafka topic to the appropriate screening function."""
+    # Deduplication check
+    event_id = payload.get("event_id")
+    if event_id:
+        db = SessionLocal()
+        try:
+            if kafka.is_duplicate_event(db, event_id):
+                log.debug("Duplicate event skipped: %s", event_id)
+                return
+            kafka.mark_event_processed(db, event_id, topic)
+            db.commit()
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
+
     try:
         if topic in ("token.issuance.completed", "token.redemption.completed"):
             _run_screening(

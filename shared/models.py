@@ -5,12 +5,11 @@ All services import from this module to keep the domain model canonical.
 
 import enum
 import uuid
-from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, Column, Date, DateTime,
-    Enum, ForeignKey, Index, Integer, Numeric, SmallInteger, String,
+    BigInteger, Boolean, Column, Date, DateTime,
+    Enum, ForeignKey, Numeric, SmallInteger, String,
     Text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -39,8 +38,13 @@ class TxnStatus(str, enum.Enum):
     REVERSED   = "reversed"
 
 class SettlementStatus(str, enum.Enum):
+    PENDING    = "pending"
+    APPROVED   = "approved"
+    SIGNED     = "signed"
     QUEUED     = "queued"
     PROCESSING = "processing"
+    BROADCASTED = "broadcasted"
+    CONFIRMED  = "confirmed"
     SETTLED    = "settled"
     FAILED     = "failed"
     CANCELLED  = "cancelled"
@@ -88,6 +92,13 @@ class HoldType(str, enum.Enum):
     RESERVE = "reserve"
     RELEASE = "release"
 
+class UserRole(str, enum.Enum):
+    ADMIN    = "admin"
+    APPROVER = "approver"
+    SIGNER   = "signer"
+    TRADER   = "trader"
+    AUDITOR  = "auditor"
+
 
 # ─── Base ─────────────────────────────────────────────────────────────────────
 
@@ -114,6 +125,31 @@ class Account(Base):
     updated_at              = Column(DateTime(timezone=True), onupdate=func.now())
 
     token_balances = relationship("TokenBalance", back_populates="account", lazy="selectin")
+
+
+# ─── ApiKey (RBAC) ───────────────────────────────────────────────────────────
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key_hash   = Column(String(64), unique=True, nullable=False, index=True)
+    actor_id   = Column(UUID(as_uuid=True), nullable=False, index=True)
+    actor_name = Column(String(255), nullable=False)
+    role       = Column(Enum(UserRole, name="user_role", values_callable=lambda e: [x.value for x in e]), nullable=False)
+    is_active  = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True))
+
+
+# ─── ProcessedEvent (Kafka deduplication) ────────────────────────────────────
+
+class ProcessedEvent(Base):
+    __tablename__ = "processed_events"
+
+    event_id     = Column(String(255), primary_key=True)
+    topic        = Column(String(255), nullable=False)
+    processed_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 # ─── TokenBalance (legacy — replaced by account_balances VIEW) ───────────────
@@ -223,6 +259,9 @@ class TransactionStatusHistory(Base):
     detail         = Column(JSONB)
     tx_hash        = Column(String(255))
     block_number   = Column(BigInteger)
+    request_id     = Column(UUID(as_uuid=True))
+    actor_id       = Column(UUID(as_uuid=True))
+    actor_service  = Column(String(100))
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -233,6 +272,9 @@ class RTGSSettlementStatusHistory(Base):
     settlement_id = Column(UUID(as_uuid=True), ForeignKey("rtgs_settlements.id"), nullable=False, index=True)
     status        = Column(String(20), nullable=False)
     detail        = Column(JSONB)
+    request_id    = Column(UUID(as_uuid=True))
+    actor_id      = Column(UUID(as_uuid=True))
+    actor_service = Column(String(100))
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -243,37 +285,49 @@ class FXSettlementStatusHistory(Base):
     settlement_id = Column(UUID(as_uuid=True), ForeignKey("fx_settlements.id"), nullable=False, index=True)
     status        = Column(String(20), nullable=False)
     detail        = Column(JSONB)
+    request_id    = Column(UUID(as_uuid=True))
+    actor_id      = Column(UUID(as_uuid=True))
+    actor_service = Column(String(100))
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class EscrowStatusHistory(Base):
     __tablename__ = "escrow_status_history"
 
-    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    escrow_id  = Column(UUID(as_uuid=True), ForeignKey("escrow_contracts.id"), nullable=False, index=True)
-    status     = Column(String(20), nullable=False)
-    detail     = Column(JSONB)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    escrow_id     = Column(UUID(as_uuid=True), ForeignKey("escrow_contracts.id"), nullable=False, index=True)
+    status        = Column(String(20), nullable=False)
+    detail        = Column(JSONB)
+    request_id    = Column(UUID(as_uuid=True))
+    actor_id      = Column(UUID(as_uuid=True))
+    actor_service = Column(String(100))
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class ConditionalPaymentStatusHistory(Base):
     __tablename__ = "conditional_payment_status_history"
 
-    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    payment_id = Column(UUID(as_uuid=True), ForeignKey("conditional_payments.id"), nullable=False, index=True)
-    status     = Column(String(20), nullable=False)
-    detail     = Column(JSONB)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    payment_id    = Column(UUID(as_uuid=True), ForeignKey("conditional_payments.id"), nullable=False, index=True)
+    status        = Column(String(20), nullable=False)
+    detail        = Column(JSONB)
+    request_id    = Column(UUID(as_uuid=True))
+    actor_id      = Column(UUID(as_uuid=True))
+    actor_service = Column(String(100))
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class TokenIssuanceStatusHistory(Base):
     __tablename__ = "token_issuance_status_history"
 
-    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    issuance_id = Column(UUID(as_uuid=True), ForeignKey("token_issuances.id"), nullable=False, index=True)
-    status      = Column(String(20), nullable=False)
-    detail      = Column(JSONB)
-    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    issuance_id   = Column(UUID(as_uuid=True), ForeignKey("token_issuances.id"), nullable=False, index=True)
+    status        = Column(String(20), nullable=False)
+    detail        = Column(JSONB)
+    request_id    = Column(UUID(as_uuid=True))
+    actor_id      = Column(UUID(as_uuid=True))
+    actor_service = Column(String(100))
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 
 # ─── TokenIssuance ────────────────────────────────────────────────────────────
@@ -291,6 +345,9 @@ class TokenIssuance(Base):
     issuance_type       = Column(String(20), nullable=False)
     status              = Column(Enum(TxnStatus, name="txn_status", values_callable=lambda e: [x.value for x in e]), nullable=False, default=TxnStatus.PENDING)
     compliance_check_id = Column(UUID(as_uuid=True))
+    request_id          = Column(UUID(as_uuid=True))
+    actor_id            = Column(UUID(as_uuid=True))
+    actor_service       = Column(String(100))
     issued_at           = Column(DateTime(timezone=True))
     redeemed_at         = Column(DateTime(timezone=True))
     created_at          = Column(DateTime(timezone=True), server_default=func.now())
@@ -311,6 +368,9 @@ class Transaction(Base):
     status            = Column(Enum(TxnStatus, name="txn_status", values_callable=lambda e: [x.value for x in e]), nullable=False, default=TxnStatus.PENDING)
     idempotency_key   = Column(String(128), unique=True)
     parent_txn_id     = Column(UUID(as_uuid=True), ForeignKey("transactions.id"))
+    request_id        = Column(UUID(as_uuid=True))
+    actor_id          = Column(UUID(as_uuid=True))
+    actor_service     = Column(String(100))
     extra_metadata    = Column("metadata", JSONB, nullable=False, default=dict)
     created_at        = Column(DateTime(timezone=True), server_default=func.now())
     settled_at        = Column(DateTime(timezone=True))
@@ -336,6 +396,13 @@ class RTGSSettlement(Base):
     settled_at           = Column(DateTime(timezone=True))
     failure_reason       = Column(Text)
     retry_count          = Column(SmallInteger, nullable=False, default=0)
+    approved_by          = Column(UUID(as_uuid=True))
+    approved_at          = Column(DateTime(timezone=True))
+    signed_by            = Column(UUID(as_uuid=True))
+    signed_at            = Column(DateTime(timezone=True))
+    request_id           = Column(UUID(as_uuid=True))
+    actor_id             = Column(UUID(as_uuid=True))
+    actor_service        = Column(String(100))
     extra_metadata       = Column("metadata", JSONB, nullable=False, default=dict)
 
 
@@ -358,6 +425,9 @@ class EscrowContract(Base):
     expires_at             = Column(DateTime(timezone=True), nullable=False)
     released_at            = Column(DateTime(timezone=True))
     release_triggered_by   = Column(String(100))
+    request_id             = Column(UUID(as_uuid=True))
+    actor_id               = Column(UUID(as_uuid=True))
+    actor_service          = Column(String(100))
     extra_metadata         = Column("metadata", JSONB, nullable=False, default=dict)
     created_at             = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -378,6 +448,9 @@ class ConditionalPayment(Base):
     status           = Column(Enum(TxnStatus, name="txn_status", values_callable=lambda e: [x.value for x in e]), nullable=False, default=TxnStatus.PENDING)
     trigger_data     = Column(JSONB)
     transaction_id   = Column(UUID(as_uuid=True), ForeignKey("transactions.id"))
+    request_id       = Column(UUID(as_uuid=True))
+    actor_id         = Column(UUID(as_uuid=True))
+    actor_service    = Column(String(100))
     created_at       = Column(DateTime(timezone=True), server_default=func.now())
     executed_at      = Column(DateTime(timezone=True))
     expires_at       = Column(DateTime(timezone=True))
@@ -411,9 +484,12 @@ class ComplianceEvent(Base):
     entity_id   = Column(UUID(as_uuid=True), nullable=False)
     event_type  = Column(String(50),  nullable=False)
     result      = Column(String(20),  nullable=False)
-    score       = Column(Numeric(5, 2))
-    details     = Column(JSONB, nullable=False, default=dict)
-    checked_at  = Column(DateTime(timezone=True), server_default=func.now())
+    score         = Column(Numeric(5, 2))
+    details       = Column(JSONB, nullable=False, default=dict)
+    request_id    = Column(UUID(as_uuid=True))
+    actor_id      = Column(UUID(as_uuid=True))
+    actor_service = Column(String(100))
+    checked_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 
 # ─── FXSettlement ─────────────────────────────────────────────────────────────
@@ -437,6 +513,9 @@ class FXSettlement(Base):
     buy_txn_id           = Column(UUID(as_uuid=True), ForeignKey("transactions.id"))
     blockchain_tx_hash   = Column(String(255))
     value_date           = Column(Date)
+    request_id           = Column(UUID(as_uuid=True))
+    actor_id             = Column(UUID(as_uuid=True))
+    actor_service        = Column(String(100))
     created_at           = Column(DateTime(timezone=True), server_default=func.now())
     settled_at           = Column(DateTime(timezone=True))
     extra_metadata       = Column("metadata", JSONB, nullable=False, default=dict)

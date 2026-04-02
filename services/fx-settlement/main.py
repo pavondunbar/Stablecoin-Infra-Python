@@ -463,6 +463,7 @@ class InitiateFXSettlementRequest(BaseModel):
     rails:                SettlementRails = SettlementRails.BLOCKCHAIN
     value_date:           Optional[date] = None
     metadata:             dict = Field(default_factory=dict)
+    idempotency_key:      Optional[str] = None
 
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
@@ -568,6 +569,26 @@ def initiate_fx_settlement(
     if req.sell_currency == req.buy_currency:
         raise HTTPException(status_code=400, detail="Currency pair must differ")
 
+    # Idempotency guard
+    if req.idempotency_key:
+        existing = db.execute(
+            select(FXSettlement).where(
+                FXSettlement.settlement_ref == req.idempotency_key
+            )
+        ).scalar_one_or_none()
+        if existing:
+            return {
+                "settlement_ref":      existing.settlement_ref,
+                "status":              existing.status.value,
+                "sell_currency":       existing.sell_currency.value,
+                "sell_amount":         str(existing.sell_amount),
+                "buy_currency":        existing.buy_currency.value,
+                "buy_amount":          str(existing.buy_amount),
+                "applied_rate":        str(existing.applied_rate),
+                "rails":               existing.rails.value,
+                "value_date":          str(existing.value_date),
+            }
+
     sender   = db.get(Account, req.sending_account_id)
     receiver = db.get(Account, req.receiving_account_id)
     if not sender or not sender.is_active:
@@ -589,7 +610,7 @@ def initiate_fx_settlement(
 
     sell_amount = req.sell_amount.quantize(PRECISION, rounding=ROUND_HALF_EVEN)
     buy_amount  = (sell_amount * applied_rate).quantize(PRECISION, rounding=ROUND_DOWN)
-    ref         = f"FXS-{uuid.uuid4().hex[:16].upper()}"
+    ref         = req.idempotency_key or f"FXS-{uuid.uuid4().hex[:16].upper()}"
 
     fx = FXSettlement(
         settlement_ref=ref,

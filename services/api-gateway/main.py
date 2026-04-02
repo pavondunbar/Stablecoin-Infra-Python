@@ -37,6 +37,8 @@ sys.path.insert(0, "/app/shared")
 import kafka_client as kafka
 from metrics import instrument_app
 from events import AuditTrailEntry
+from database import get_db_session, SessionLocal
+from rbac import hash_api_key, resolve_api_key, match_route_role
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -89,19 +91,56 @@ async def get_client() -> httpx.AsyncClient:
 # ─── Auth Dependency ──────────────────────────────────────────────────────────
 
 async def require_api_key(request: Request):
-    key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
-    if not key or key != GATEWAY_API_KEY:
+    raw_key = (
+        request.headers.get("X-API-Key")
+        or request.query_params.get("api_key")
+    )
+    if not raw_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key",
+            detail="Missing API key",
             headers={"WWW-Authenticate": "ApiKey"},
         )
-    if not limiter.is_allowed(key):
+
+    # DB-backed key lookup
+    db = SessionLocal()
+    try:
+        api_key = resolve_api_key(db, raw_key)
+    finally:
+        db.close()
+
+    # Fallback to legacy single-key auth
+    if not api_key:
+        if raw_key != GATEWAY_API_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API key",
+                headers={"WWW-Authenticate": "ApiKey"},
+            )
+        request.state.actor_id = None
+        request.state.actor_role = "admin"
+        request.state.actor_name = "legacy-key"
+    else:
+        path = request.url.path
+        allowed_roles = match_route_role(path)
+        if allowed_roles and api_key.role.value not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Role '{api_key.role.value}' not "
+                    f"authorized for {path}"
+                ),
+            )
+        request.state.actor_id = str(api_key.actor_id)
+        request.state.actor_role = api_key.role.value
+        request.state.actor_name = api_key.actor_name
+
+    if not limiter.is_allowed(raw_key):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded. Max 1000 requests per 60 seconds.",
         )
-    return key
+    return raw_key
 
 
 # ─── Proxy Helper ─────────────────────────────────────────────────────────────
@@ -121,6 +160,13 @@ async def _proxy(
         if k.lower() not in ("host", "x-api-key", "content-length")
     }
     headers["X-Request-ID"] = request.state.request_id
+    headers["X-Actor-Service"] = SERVICE
+    if hasattr(request.state, "actor_id") and request.state.actor_id:
+        headers["X-Actor-ID"] = str(request.state.actor_id)
+    if hasattr(request.state, "actor_role"):
+        headers["X-Actor-Role"] = request.state.actor_role
+    if hasattr(request.state, "actor_name"):
+        headers["X-Actor-Name"] = request.state.actor_name
 
     try:
         upstream_resp = await client.request(

@@ -221,6 +221,7 @@ class CreateConditionalPaymentRequest(BaseModel):
     condition_type:   ConditionType
     condition_params: dict
     expires_at:       Optional[datetime] = None
+    idempotency_key:  Optional[str] = None
 
 
 class TriggerConditionalPaymentRequest(BaseModel):
@@ -236,6 +237,7 @@ class CreateEscrowRequest(BaseModel):
     conditions:             dict
     expires_at:             datetime
     arbiter_account_id:     Optional[str] = None
+    idempotency_key:        Optional[str] = None
 
 
 class ReleaseEscrowRequest(BaseModel):
@@ -450,6 +452,22 @@ def create_conditional_payment(
     For time_lock conditions, the background checker will execute automatically.
     For oracle / multi_sig / delivery, call POST /payments/conditional/{ref}/trigger.
     """
+    # Idempotency guard
+    if req.idempotency_key:
+        existing = db.execute(
+            select(ConditionalPayment).where(
+                ConditionalPayment.payment_ref == req.idempotency_key
+            )
+        ).scalar_one_or_none()
+        if existing:
+            return {
+                "payment_ref":    existing.payment_ref,
+                "status":         existing.status.value,
+                "condition_type": existing.condition_type.value,
+                "amount":         str(existing.amount),
+                "currency":       existing.currency.value,
+            }
+
     payer = db.get(Account, req.payer_account_id)
     if not payer or not payer.is_active:
         raise HTTPException(status_code=404, detail="Payer account not found")
@@ -458,7 +476,7 @@ def create_conditional_payment(
         raise HTTPException(status_code=404, detail="Payee account not found")
 
     amount = req.amount.quantize(PRECISION, rounding=ROUND_HALF_EVEN)
-    ref    = f"CP-{uuid.uuid4().hex[:16].upper()}"
+    ref    = req.idempotency_key or f"CP-{uuid.uuid4().hex[:16].upper()}"
 
     cp = ConditionalPayment(
         payment_ref=ref,
@@ -577,6 +595,24 @@ def create_escrow(req: CreateEscrowRequest, db: Session = Depends(get_db_session
     Funds are immediately reserved (locked) in the depositor's balance.
     Release conditions are stored on the contract.
     """
+    # Idempotency guard
+    if req.idempotency_key:
+        existing = db.execute(
+            select(EscrowContract).where(
+                EscrowContract.contract_ref == req.idempotency_key
+            )
+        ).scalar_one_or_none()
+        if existing:
+            return {
+                "contract_ref":          existing.contract_ref,
+                "status":                existing.status.value,
+                "amount":                str(existing.amount),
+                "currency":              existing.currency.value,
+                "expires_at":            existing.expires_at,
+                "depositor_account_id":  str(existing.depositor_account_id),
+                "beneficiary_account_id": str(existing.beneficiary_account_id),
+            }
+
     depositor = db.get(Account, req.depositor_account_id)
     if not depositor or not depositor.is_active:
         raise HTTPException(status_code=404, detail="Depositor account not found")

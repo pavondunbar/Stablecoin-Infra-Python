@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import asc, select
 from sqlalchemy.orm import Session
@@ -50,6 +50,12 @@ from shared.journal import (
 )
 from shared.outbox import insert_outbox_event
 from shared.status import record_status
+from shared.state_machine import (
+    RTGS_VALID_TRANSITIONS,
+    validate_transition,
+)
+from shared.rbac import require_role, check_separation_of_duties
+from shared.context import extract_context
 from shared.models import (
     RTGSSettlementStatusHistory,
     TransactionStatusHistory,
@@ -177,11 +183,11 @@ def _process_one_settlement(db: Session, settlement: RTGSSettlement) -> bool:
         settlement.retry_count += 1
 
         if settlement.retry_count < MAX_RETRY and "Insufficient" not in str(exc):
-            settlement.status = SettlementStatus.QUEUED
+            settlement.status = SettlementStatus.SIGNED
             record_status(
                 db, RTGSSettlementStatusHistory,
                 "settlement_id", settlement.id,
-                SettlementStatus.QUEUED.value,
+                SettlementStatus.SIGNED.value,
                 detail={"reason": str(exc), "retry": settlement.retry_count},
             )
             log.warning("Retry %d/%d for %s",
@@ -223,7 +229,7 @@ def _settlement_worker():
                 # Priority-ordered dequeue
                 pending = db.execute(
                     select(RTGSSettlement)
-                    .where(RTGSSettlement.status == SettlementStatus.QUEUED)
+                    .where(RTGSSettlement.status == SettlementStatus.SIGNED)
                     .order_by(
                         # urgent=0, high=1, normal=2, low=3 — use array_position equivalent
                         RTGSSettlement.priority.asc(),
@@ -349,7 +355,7 @@ def submit_settlement(req: SubmitSettlementRequest, db: Session = Depends(get_db
         currency=req.currency,
         amount=amount,
         priority=req.priority,
-        status=SettlementStatus.QUEUED,
+        status=SettlementStatus.PENDING,
         scheduled_at=req.scheduled_at,
         extra_metadata=req.metadata,
     )
@@ -429,6 +435,99 @@ def list_settlements(
         }
         for r in results
     ]
+
+
+@app.post("/settlements/{settlement_ref}/approve")
+def approve_settlement(
+    settlement_ref: str,
+    request: Request,
+    db: Session = Depends(get_db_session),
+    _role=Depends(require_role("admin", "approver")),
+):
+    """Approve a pending settlement (requires approver role)."""
+    s = db.execute(
+        select(RTGSSettlement).where(
+            RTGSSettlement.settlement_ref == settlement_ref
+        ).with_for_update()
+    ).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+
+    validate_transition(
+        s.status.value, "approved", RTGS_VALID_TRANSITIONS
+    )
+
+    ctx = extract_context(request)
+    actor_id = ctx.get("actor_id")
+
+    s.status = SettlementStatus.APPROVED
+    s.approved_by = actor_id
+    s.approved_at = datetime.now(timezone.utc)
+    record_status(
+        db, RTGSSettlementStatusHistory,
+        "settlement_id", s.id,
+        SettlementStatus.APPROVED.value,
+        detail={"approved_by": str(actor_id)},
+        request_id=ctx.get("request_id"),
+        actor_id=actor_id,
+        actor_service=ctx.get("actor_service"),
+    )
+    db.flush()
+    return {
+        "settlement_ref": s.settlement_ref,
+        "status": s.status.value,
+        "approved_by": str(s.approved_by),
+        "approved_at": s.approved_at,
+    }
+
+
+@app.post("/settlements/{settlement_ref}/sign")
+def sign_settlement(
+    settlement_ref: str,
+    request: Request,
+    db: Session = Depends(get_db_session),
+    _role=Depends(require_role("admin", "signer")),
+):
+    """Sign an approved settlement (requires signer role, different actor)."""
+    s = db.execute(
+        select(RTGSSettlement).where(
+            RTGSSettlement.settlement_ref == settlement_ref
+        ).with_for_update()
+    ).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+
+    validate_transition(
+        s.status.value, "signed", RTGS_VALID_TRANSITIONS
+    )
+
+    ctx = extract_context(request)
+    actor_id = ctx.get("actor_id")
+
+    check_separation_of_duties(
+        str(s.approved_by) if s.approved_by else "",
+        str(actor_id) if actor_id else "",
+    )
+
+    s.status = SettlementStatus.SIGNED
+    s.signed_by = actor_id
+    s.signed_at = datetime.now(timezone.utc)
+    record_status(
+        db, RTGSSettlementStatusHistory,
+        "settlement_id", s.id,
+        SettlementStatus.SIGNED.value,
+        detail={"signed_by": str(actor_id)},
+        request_id=ctx.get("request_id"),
+        actor_id=actor_id,
+        actor_service=ctx.get("actor_service"),
+    )
+    db.flush()
+    return {
+        "settlement_ref": s.settlement_ref,
+        "status": s.status.value,
+        "signed_by": str(s.signed_by),
+        "signed_at": s.signed_at,
+    }
 
 
 if __name__ == "__main__":
