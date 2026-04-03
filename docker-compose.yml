@@ -208,7 +208,7 @@ services:
       kafka:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://stablecoin:stablecoin_pass@postgres:5432/stablecoin_db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-stablecoin}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-stablecoin_db}
       KAFKA_BOOTSTRAP: kafka:9092
       POLL_INTERVAL_MS: 100
       SERVICE_NAME: outbox-publisher
@@ -371,6 +371,7 @@ services:
         condition: service_healthy
     environment:
       SERVICE_NAME: api-gateway
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-stablecoin}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-stablecoin_db}
       TOKEN_ISSUANCE_URL: http://token-issuance:8001
       RTGS_URL: http://rtgs:8002
       PAYMENT_ENGINE_URL: http://payment-engine:8003

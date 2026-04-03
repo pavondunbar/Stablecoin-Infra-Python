@@ -156,9 +156,9 @@ def _issue_tokens(
     # Acquire advisory lock on omnibus account
     acquire_balance_lock(db, OMNIBUS_ACCOUNT_ID, currency)
 
-    # Check omnibus reserve balance via journal
+    # Check omnibus reserve balance via journal (asset account)
     omnibus_balance = journal_get_balance(
-        db, OMNIBUS_ACCOUNT_ID, currency
+        db, OMNIBUS_ACCOUNT_ID, currency, coa_code="OMNIBUS_RESERVE"
     )
     if omnibus_balance < amount:
         raise HTTPException(
@@ -190,7 +190,7 @@ def _issue_tokens(
         currency,
         amount,
         "token_issuance",
-        issuance_ref,
+        str(issuance.id),
         str(account.id),
         "INSTITUTION_LIABILITY",
         narrative,
@@ -338,7 +338,7 @@ def _redeem_tokens(
         currency,
         amount,
         "token_redemption",
-        redemption_ref,
+        str(issuance.id),
         OMNIBUS_ACCOUNT_ID,
         "OMNIBUS_RESERVE",
         narrative,

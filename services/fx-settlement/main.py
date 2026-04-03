@@ -151,9 +151,18 @@ def _execute_leg(
           buy:  debit nostro FX_NOSTRO_{currency},
                 credit receiver INSTITUTION_LIABILITY
     """
+    if leg_type == "sell":
+        debit_coa = "INSTITUTION_LIABILITY"
+        credit_coa = f"FX_NOSTRO_{currency}"
+    else:
+        debit_coa = f"FX_NOSTRO_{currency}"
+        credit_coa = "INSTITUTION_LIABILITY"
+
     acquire_balance_lock(db, debit_id, currency)
 
-    available = journal_get_balance(db, debit_id, currency)
+    available = journal_get_balance(
+        db, debit_id, currency, coa_code=debit_coa,
+    )
     if available < amount:
         raise ValueError(
             f"Insufficient {currency} balance for {debit_id}: "
@@ -161,13 +170,6 @@ def _execute_leg(
         )
 
     ref = f"FX-{uuid.uuid4().hex[:16].upper()}"
-
-    if leg_type == "sell":
-        debit_coa = "INSTITUTION_LIABILITY"
-        credit_coa = f"FX_NOSTRO_{currency}"
-    else:
-        debit_coa = f"FX_NOSTRO_{currency}"
-        credit_coa = "INSTITUTION_LIABILITY"
 
     txn = Transaction(
         txn_ref=ref,
@@ -200,7 +202,7 @@ def _execute_leg(
         TransactionStatusHistory,
         entity_id_field="transaction_id",
         entity_id=txn.id,
-        status="COMPLETED",
+        status="completed",
     )
 
     return txn
@@ -217,7 +219,7 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
     record_status(
         db, FXSettlementStatusHistory,
         entity_id_field="settlement_id",
-        entity_id=fx.id, status="PROCESSING",
+        entity_id=fx.id, status="processing",
     )
     db.flush()
 
@@ -305,7 +307,7 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
         record_status(
             db, FXSettlementStatusHistory,
             entity_id_field="settlement_id",
-            entity_id=fx.id, status="SETTLED",
+            entity_id=fx.id, status="settled",
         )
         db.flush()
 
@@ -334,7 +336,7 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
         record_status(
             db, FXSettlementStatusHistory,
             entity_id_field="settlement_id",
-            entity_id=fx.id, status="FAILED",
+            entity_id=fx.id, status="failed",
             detail={"reason": str(exc)},
         )
         db.flush()
@@ -633,7 +635,7 @@ def initiate_fx_settlement(
     record_status(
         db, FXSettlementStatusHistory,
         entity_id_field="settlement_id",
-        entity_id=fx.id, status="QUEUED",
+        entity_id=fx.id, status="queued",
     )
     insert_outbox_event(
         db, ref,

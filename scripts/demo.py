@@ -176,6 +176,30 @@ def demo_rtgs(bank_a_id: str, bank_b_id: str) -> dict:
     ref  = data["settlement_ref"]
     ok(f"Submitted: {ref}  status={data['status']}  priority={data['priority']}")
 
+    step("Approve settlement (approver role)")
+    approver = httpx.Client(
+        base_url=GW,
+        headers={"X-API-Key": "approver-key-demo-001",
+                 "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r = approver.post(f"/v1/settlements/{ref}/approve")
+    data = check(r, 200)
+    ok(f"Approved by: {data['approved_by']}")
+    approver.close()
+
+    step("Sign settlement (signer role, different actor)")
+    signer = httpx.Client(
+        base_url=GW,
+        headers={"X-API-Key": "signer-key-demo-001",
+                 "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r = signer.post(f"/v1/settlements/{ref}/sign")
+    data = check(r, 200)
+    ok(f"Signed by: {data['signed_by']}  (separation of duties enforced)")
+    signer.close()
+
     step("Poll settlement status (worker processes async)")
     for attempt in range(10):
         time.sleep(1.5)

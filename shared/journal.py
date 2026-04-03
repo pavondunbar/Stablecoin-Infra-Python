@@ -67,20 +67,40 @@ def record_journal_pair(
     return str(journal_id)
 
 
-def get_balance(db: Session, account_id: str, currency: str) -> Decimal:
-    """Derive balance from journal entries: SUM(credit) - SUM(debit).
+def get_balance(
+    db: Session,
+    account_id: str,
+    currency: str,
+    coa_code: str = "INSTITUTION_LIABILITY",
+) -> Decimal:
+    """Derive balance from journal entries.
 
-    Scoped to INSTITUTION_LIABILITY COA code by default.
+    For liability accounts (INSTITUTION_LIABILITY): SUM(credit) - SUM(debit).
+    For asset accounts (OMNIBUS_RESERVE, FX_NOSTRO_*): SUM(debit) - SUM(credit).
     """
     acct_uuid = uuid.UUID(account_id) if isinstance(account_id, str) else account_id
-    result = db.execute(
-        select(
+
+    asset_codes = {
+        "OMNIBUS_RESERVE", "FX_NOSTRO_USD",
+        "FX_NOSTRO_EUR", "FX_NOSTRO_GBP",
+    }
+
+    if coa_code in asset_codes:
+        expr = (
+            func.coalesce(func.sum(JournalEntry.debit), ZERO)
+            - func.coalesce(func.sum(JournalEntry.credit), ZERO)
+        )
+    else:
+        expr = (
             func.coalesce(func.sum(JournalEntry.credit), ZERO)
             - func.coalesce(func.sum(JournalEntry.debit), ZERO)
-        ).where(
+        )
+
+    result = db.execute(
+        select(expr).where(
             JournalEntry.account_id == acct_uuid,
             JournalEntry.currency == currency,
-            JournalEntry.coa_code == "INSTITUTION_LIABILITY",
+            JournalEntry.coa_code == coa_code,
         )
     ).scalar()
     return result if result is not None else ZERO

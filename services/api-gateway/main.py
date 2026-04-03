@@ -102,10 +102,14 @@ async def require_api_key(request: Request):
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    # DB-backed key lookup
+    # DB-backed key lookup (gracefully degrade if RBAC tables
+    # have not been created yet, e.g. migration 0004 not applied)
+    api_key = None
     db = SessionLocal()
     try:
         api_key = resolve_api_key(db, raw_key)
+    except Exception:
+        log.debug("RBAC table lookup failed; falling back to legacy key auth")
     finally:
         db.close()
 
