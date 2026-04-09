@@ -94,8 +94,8 @@ db-balances: ## Show all token balances
 
 db-ledger: ## Show recent ledger entries
 	$(COMPOSE) exec postgres psql -U stablecoin -d stablecoin_db -c \
-	  "SELECT txn_ref,entry_type,currency,amount,balance_after,LEFT(narrative,40),created_at \
-	   FROM ledger_entries ORDER BY created_at DESC LIMIT 20;"
+	  "SELECT journal_id,entry_type,currency,debit,credit,coa_code,LEFT(narrative,40),created_at \
+	   FROM journal_entries ORDER BY created_at DESC LIMIT 20;"
 
 db-rtgs: ## Show recent RTGS settlements
 	$(COMPOSE) exec postgres psql -U stablecoin -d stablecoin_db -c \

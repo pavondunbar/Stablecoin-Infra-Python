@@ -454,7 +454,7 @@ def run():
         f"WHERE id IN ('{bank_a_id}', '{bank_b_id}');"
     )
     result = subprocess.run(
-        ["docker", "exec", "stablecoin-python-postgres-1",
+        ["docker", "exec", "stablecoin-postgres-1",
          "psql", "-U", "stablecoin", "-d", "stablecoin_db", "-c", sql],
         capture_output=True, text=True, timeout=10,
     )
