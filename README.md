@@ -672,18 +672,31 @@ Each microservice exposes a `/metrics` endpoint scraped by Prometheus every 15 s
 ### Makefile Targets
 
 ```bash
+make help            # Show all available targets
 make up              # Build and start all services
 make down            # Stop containers (keep volumes)
 make down-v          # Stop and remove volumes (full reset)
+make build           # Rebuild all images without starting
+make restart         # Restart all services
 make logs            # Follow all service logs
 make logs-svc SVC=rtgs  # Follow one service's logs
-make test            # Full test suite
+make ps              # Container status
+make health          # Check gateway health
 make demo            # Run live stack demo
+make test            # Full test suite
+make test-unit       # Unit tests only
+make test-e2e        # End-to-end scenario tests
 make integrity       # Ledger double-entry integrity check
-make kafka-tail      # Tail all Kafka topics
+make seed-accounts   # Insert KYC-cleared demo accounts
 make db-balances     # Show all token balances
 make db-ledger       # Show recent ledger entries
-make health          # Check gateway health
+make db-rtgs         # Show recent RTGS settlements
+make db-fx           # Show recent FX settlements
+make shell-pg        # PostgreSQL psql shell
+make shell-kafka     # Kafka bash shell
+make topics          # List Kafka topics
+make kafka-tail      # Tail all Kafka topics
+make open-docs       # Open API docs in browser
 ```
 
 ---
