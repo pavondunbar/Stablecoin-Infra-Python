@@ -61,7 +61,7 @@ from shared.models import (
     TransactionStatusHistory,
     JournalEntry,
 )
-from shared.blockchain_sim import record_on_chain
+from shared.blockchain_sim import record_on_chain, record_fiat_rail
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -154,12 +154,25 @@ def _process_one_settlement(db: Session, settlement: RTGSSettlement) -> bool:
         settlement.settled_at = datetime.now(timezone.utc)
         settlement.transaction_id = txn.id
 
-        # Record on simulated blockchain
+        # Token leg: always recorded on-chain (token movement is always
+        # on the permissioned ledger regardless of fiat clearing rail).
         receipt = record_on_chain(
             settlement.settlement_ref, "rtgs_settlement"
         )
+        # Fiat leg: FedWire is the default clearing rail for RTGS USD.
+        # In production this would be the actual FedWire IMAD/OMAD.
+        fiat_receipt = record_fiat_rail(
+            settlement.settlement_ref, "fedwire"
+        )
+        if fiat_receipt:
+            fiat_receipt["settled_at"] = settlement.settled_at.isoformat()
+
         settlement.extra_metadata = {
-            **settlement.extra_metadata, "blockchain": receipt
+            **settlement.extra_metadata,
+            "token_leg": receipt,
+            "fiat_leg": fiat_receipt,
+            # keep legacy key for backwards compat
+            "blockchain": receipt,
         }
 
         record_status(
@@ -419,7 +432,10 @@ def get_settlement(settlement_ref: str, db: Session = Depends(get_db_session)):
         "failure_reason":       s.failure_reason,
         "retry_count":          s.retry_count,
         "transaction_id":       str(s.transaction_id) if s.transaction_id else None,
-        "blockchain":           s.extra_metadata.get("blockchain"),
+        # Hybrid: token leg (on-chain) + fiat leg (FedWire) always both present
+        "token_leg":            s.extra_metadata.get("token_leg"),
+        "fiat_leg":             s.extra_metadata.get("fiat_leg"),
+        "blockchain":           s.extra_metadata.get("blockchain"),  # backwards compat
     }
 
 

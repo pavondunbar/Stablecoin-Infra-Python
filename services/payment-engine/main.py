@@ -61,7 +61,7 @@ from shared.models import (
     ConditionalPaymentStatusHistory,
     TransactionStatusHistory, JournalEntry,
 )
-from shared.blockchain_sim import record_on_chain
+from shared.blockchain_sim import record_on_chain, record_fiat_rail
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -345,12 +345,19 @@ def _execute_conditional_payment(
     cp.executed_at = datetime.now(timezone.utc)
     cp.transaction_id = txn.id
 
-    # Record on simulated blockchain
+    # Token leg: always on-chain. Fiat leg: internal book transfer
+    # (same institution) uses the internal rail.
     receipt = record_on_chain(
         cp.payment_ref, "conditional_payment"
     )
+    fiat_receipt = record_fiat_rail(cp.payment_ref, "internal")
+    if fiat_receipt:
+        fiat_receipt["settled_at"] = cp.executed_at.isoformat()
     cp.trigger_data = {
-        **(cp.trigger_data or {}), "blockchain": receipt
+        **(cp.trigger_data or {}),
+        "token_leg": receipt,
+        "fiat_leg": fiat_receipt,
+        "blockchain": receipt,  # backwards compat
     }
 
     db.flush()
@@ -746,10 +753,15 @@ def release_escrow(
         receipt = record_on_chain(
             contract_ref, "escrow_release"
         )
+        fiat_receipt = record_fiat_rail(contract_ref, "internal")
+        if fiat_receipt:
+            fiat_receipt["settled_at"] = datetime.now(timezone.utc).isoformat()
         return {
             "result": "released_to_beneficiary",
             "transaction_id": str(txn.id),
-            "blockchain": receipt,
+            "token_leg": receipt,
+            "fiat_leg": fiat_receipt,
+            "blockchain": receipt,  # backwards compat
         }
 
     else:  # refund to depositor — un-reserve the funds

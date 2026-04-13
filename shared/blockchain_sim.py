@@ -14,6 +14,14 @@ L2 chain, producing a receipt with:
   - confirmations: always 1 (instant finality on private chain)
   - gas_used     : deterministic from transaction data
   - network      : "stablecoin-l2"
+
+Hybrid architecture note:
+  The blockchain layer and the traditional fiat rail are complementary,
+  not alternatives. Every settlement records the token movement on-chain
+  unconditionally. The fiat clearing leg (FedWire, SWIFT, TARGET2, etc.)
+  is recorded separately via record_fiat_rail(). Both receipts are stored
+  on the settlement record — the blockchain receipt for the token leg,
+  the fiat receipt for the underlying cash settlement.
 """
 
 import hashlib
@@ -66,4 +74,39 @@ def record_on_chain(
         "confirmations": 1,
         "gas_used": gas_used,
         "network": "stablecoin-l2",
+    }
+
+
+# Rail-specific reference formats (simulated)
+_FIAT_RAIL_FORMATS = {
+    "fedwire":  lambda ref: f"FW{ref[:12].upper()}",
+    "swift":    lambda ref: f"SWIFT-{ref[:8].upper()}-{ref[8:16].upper()}",
+    "target2":  lambda ref: f"T2-{ref[:16].upper()}",
+    "internal": lambda ref: f"INT-{ref[:16].upper()}",
+    "blockchain": None,  # no separate fiat leg
+}
+
+
+def record_fiat_rail(transaction_id: str, rail: str) -> dict:
+    """Simulate the fiat clearing leg for a given settlement rail.
+
+    In a real institution, this would be the FedWire IMAD/OMAD,
+    SWIFT UETR, or TARGET2 transaction reference returned by the
+    actual payment rail. Here we generate a deterministic reference.
+
+    Returns None for 'blockchain' rail (no fiat leg).
+    """
+    formatter = _FIAT_RAIL_FORMATS.get(rail)
+    if formatter is None:
+        return None
+
+    seed = f"{transaction_id}:{rail}:fiat"
+    ref_seed = hashlib.sha256(seed.encode()).hexdigest()
+    ref = formatter(ref_seed)
+
+    return {
+        "rail": rail,
+        "reference": ref,
+        "status": "settled",
+        "settled_at": None,  # populated by caller with real timestamp
     }

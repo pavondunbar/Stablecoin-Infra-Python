@@ -49,7 +49,7 @@ from shared.models import (
     TransactionStatusHistory,
     JournalEntry,
 )
-from shared.blockchain_sim import record_on_chain
+from shared.blockchain_sim import record_on_chain, record_fiat_rail
 from events import (
     TokenIssuanceCompleted, TokenIssuanceRequested,
     TokenRedemptionCompleted, TokenRedemptionRequested,
@@ -109,7 +109,8 @@ class IssuanceResponse(BaseModel):
     amount:       Decimal
     new_balance:  Decimal
     status:       str
-    blockchain:   Optional[dict] = None
+    blockchain:   Optional[dict] = None  # token leg (on-chain receipt)
+    fiat_leg:     Optional[dict] = None  # fiat clearing leg (FedWire/SWIFT)
 
 
 # ─── Business Logic ─────────────────────────────────────────────────
@@ -213,10 +214,16 @@ def _issue_tokens(
     db.add(txn)
     db.flush()
 
-    # Record on simulated blockchain and status history
+    # Token leg: minting is always recorded on-chain.
+    # Fiat leg: the backing_ref (e.g. FedWire IMAD) is the traditional
+    # rail anchor — the fiat deposit that backs this token issuance.
     receipt = record_on_chain(
         issuance_ref, "token_issuance", currency
     )
+    fiat_receipt = record_fiat_rail(issuance_ref, "fedwire")
+    if fiat_receipt:
+        fiat_receipt["backing_ref"] = issuance.backing_ref
+        fiat_receipt["settled_at"] = datetime.now(timezone.utc).isoformat()
     record_status(
         db,
         TransactionStatusHistory,
@@ -272,7 +279,7 @@ def _issue_tokens(
         ),
     )
 
-    return issuance, receipt
+    return issuance, receipt, fiat_receipt
 
 
 def _redeem_tokens(
@@ -365,10 +372,16 @@ def _redeem_tokens(
     db.add(txn)
     db.flush()
 
-    # Record on simulated blockchain and status history
+    # Token leg: burning is always recorded on-chain.
+    # Fiat leg: the redemption triggers a FedWire outbound payment
+    # back to the institution's account — recorded here as the
+    # complementary fiat clearing leg.
     receipt = record_on_chain(
         redemption_ref, "token_redemption", currency
     )
+    fiat_receipt = record_fiat_rail(redemption_ref, "fedwire")
+    if fiat_receipt:
+        fiat_receipt["settled_at"] = datetime.now(timezone.utc).isoformat()
     record_status(
         db,
         TransactionStatusHistory,
@@ -423,7 +436,7 @@ def _redeem_tokens(
         ),
     )
 
-    return issuance, receipt
+    return issuance, receipt, fiat_receipt
 
 
 # ─── FastAPI App ────────────────────────────────────────────────────
@@ -468,7 +481,7 @@ def issue_tokens(
     Atomic double-entry: omnibus reserve is debited, recipient
     is credited.
     """
-    issuance, receipt = _issue_tokens(
+    issuance, receipt, fiat_receipt = _issue_tokens(
         db,
         account_id=str(req.account_id),
         currency=req.currency.value,
@@ -490,6 +503,7 @@ def issue_tokens(
         new_balance=new_balance,
         status=issuance.status.value,
         blockchain=receipt,
+        fiat_leg=fiat_receipt,
     )
 
 
@@ -507,7 +521,7 @@ def redeem_tokens(
     Atomically burns tokens and credits the omnibus reserve for
     fiat payout.
     """
-    issuance, receipt = _redeem_tokens(
+    issuance, receipt, fiat_receipt = _redeem_tokens(
         db,
         account_id=str(req.account_id),
         currency=req.currency.value,
@@ -528,6 +542,7 @@ def redeem_tokens(
         new_balance=new_balance,
         status=issuance.status.value,
         blockchain=receipt,
+        fiat_leg=fiat_receipt,
     )
 
 

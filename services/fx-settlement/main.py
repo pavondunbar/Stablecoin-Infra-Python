@@ -60,7 +60,7 @@ from shared.models import (
     TransactionStatusHistory,
     JournalEntry,
 )
-from shared.blockchain_sim import record_on_chain
+from shared.blockchain_sim import record_on_chain, record_fiat_rail
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -294,30 +294,38 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
         fx.status = SettlementStatus.SETTLED
         fx.settled_at = now
 
-        # Record on simulated blockchain
-        receipt = record_on_chain(
-            settle_ref, "fx_settlement"
-        )
+        # Token leg: always recorded on-chain regardless of fiat rail.
+        # The blockchain receipt represents the tokenized deposit movement.
+        receipt = record_on_chain(settle_ref, "fx_settlement")
         fx.blockchain_tx_hash = receipt["tx_hash"]
-        fx.extra_metadata = {
-            **fx.extra_metadata, "blockchain": receipt
-        }
 
-        # MPC signing for blockchain rails
-        if fx.rails == SettlementRails.BLOCKCHAIN:
-            mpc_sig = _sign_settlement(
-                settle_ref,
-                {
-                    "sell_currency": fx.sell_currency.value,
-                    "sell_amount": str(fx.sell_amount),
-                    "buy_currency": fx.buy_currency.value,
-                    "buy_amount": str(fx.buy_amount),
-                },
-            )
-            if mpc_sig:
-                fx.extra_metadata["blockchain"][
-                    "mpc_signature"
-                ] = mpc_sig
+        # MPC signing always applied to the token leg.
+        mpc_sig = _sign_settlement(
+            settle_ref,
+            {
+                "sell_currency": fx.sell_currency.value,
+                "sell_amount": str(fx.sell_amount),
+                "buy_currency": fx.buy_currency.value,
+                "buy_amount": str(fx.buy_amount),
+            },
+        )
+        if mpc_sig:
+            receipt["mpc_signature"] = mpc_sig
+
+        # Fiat leg: the underlying cash clears via the chosen rail
+        # (FedWire, SWIFT, TARGET2, internal). Complementary to the
+        # token leg — both always happen.
+        fiat_receipt = record_fiat_rail(settle_ref, fx.rails.value)
+        if fiat_receipt:
+            fiat_receipt["settled_at"] = now.isoformat()
+
+        fx.extra_metadata = {
+            **fx.extra_metadata,
+            "token_leg": receipt,
+            "fiat_leg": fiat_receipt,
+            # keep legacy key for backwards compat
+            "blockchain": receipt,
+        }
 
         record_status(
             db, FXSettlementStatusHistory,
@@ -339,10 +347,13 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
             ),
         )
         log.info(
-            "FX settled: %s  %s %s -> %s %s  rate=%s  rails=%s  hash=%s",
+            "FX settled: %s  %s %s -> %s %s  rate=%s  "
+            "token_leg=block#%s tx=%s  fiat_leg=%s ref=%s",
             settle_ref, fx.sell_amount, fx.sell_currency.value,
             fx.buy_amount, fx.buy_currency.value, fx.applied_rate,
-            fx.rails.value, fx.blockchain_tx_hash or "n/a",
+            receipt["block_number"], receipt["tx_hash"][:18],
+            fx.rails.value,
+            fiat_receipt["reference"] if fiat_receipt else "n/a",
         )
         return True
 
@@ -705,7 +716,9 @@ def get_fx_settlement(settlement_ref: str, db: Session = Depends(get_db_session)
         "value_date":          str(fx.value_date),
         "created_at":          fx.created_at,
         "settled_at":          fx.settled_at,
-        "blockchain":          fx.extra_metadata.get("blockchain"),
+        # Hybrid settlement receipts: both legs always present
+        "token_leg":           fx.extra_metadata.get("token_leg"),
+        "fiat_leg":            fx.extra_metadata.get("fiat_leg"),
     }
 
 

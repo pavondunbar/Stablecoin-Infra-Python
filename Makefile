@@ -67,7 +67,7 @@ health: ## Check gateway health
 
 demo: ## Run live stack demo
 	GATEWAY_URL=http://localhost:8000 \
-	GATEWAY_API_KEY=$$(grep GATEWAY_API_KEY .env | cut -d= -f2) \
+	GATEWAY_API_KEY=$$($(COMPOSE) exec api-gateway printenv GATEWAY_API_KEY | tr -d '\r') \
 	python3 scripts/demo.py
 
 integrity: ## Ledger double-entry integrity check

@@ -84,14 +84,21 @@ def check(resp: httpx.Response, expected: int = None) -> dict:
 
 
 def show_chain(data: dict):
-    """Display simulated blockchain recording from API response."""
-    bc = data.get("blockchain")
-    if not bc:
-        return
-    ok(
-        f"Chain: block #{bc['block_number']}  "
-        f"tx={bc['tx_hash'][:18]}...  ({bc['network']})"
-    )
+    """Display hybrid settlement receipts: token leg (on-chain) + fiat leg."""
+    # Prefer new explicit keys, fall back to legacy 'blockchain'
+    token_leg = data.get("token_leg") or data.get("blockchain")
+    fiat_leg  = data.get("fiat_leg")
+
+    if token_leg:
+        ok(
+            f"Token leg (on-chain): block #{token_leg['block_number']}  "
+            f"tx={token_leg['tx_hash'][:18]}...  ({token_leg['network']})"
+        )
+    if fiat_leg:
+        ok(
+            f"Fiat leg ({fiat_leg['rail']}): ref={fiat_leg['reference']}  "
+            f"status={fiat_leg['status']}"
+        )
 
 
 # ─── Step Runner ──────────────────────────────────────────────────────────────
